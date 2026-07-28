@@ -1,0 +1,7 @@
+{
+  "TILEUNLIT": {
+    "Category": "Tile Lighting",
+    "IgnoreLighting": "Ignore Lighting",
+    "IgnoreLightingHint": "0 — normal lighting. 1 — fully ignore scene lighting."
+  }
+}
