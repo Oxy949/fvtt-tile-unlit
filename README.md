@@ -1,32 +1,92 @@
-# Tile Unlit — Foundry VTT 14
+# Tile Unlit
 
-Adds a **"Игнорировать освещение"** slider to Tile configuration:
+[![Foundry VTT](https://img.shields.io/badge/Foundry_VTT-v14-informational)](https://foundryvtt.com/)
+[![Latest Release](https://img.shields.io/github/v/release/Oxy949/fvtt-tile-unlit)](https://github.com/Oxy949/fvtt-tile-unlit/releases/latest)
+[![License](https://img.shields.io/github/license/Oxy949/fvtt-tile-unlit)](LICENSE)
 
-- `0` — core Foundry rendering.
-- `1` — the tile's colour is composited after scene lighting, so scene darkness and Ambient Light / Darkness sources do not change it.
-- Default is `0` for every tile. The value is stored in `flags.tile-unlit.ignoreLighting`.
+Tile Unlit adds a per-tile **Ignore Lighting** control to Foundry Virtual
+Tabletop. It lets selected tiles remain visible at their original brightness,
+regardless of scene darkness, Ambient Lights, or Darkness sources.
+
+## Features
+
+- Controls lighting independently for each tile.
+- Offers an adjustable effect strength from `0` to `1`:
+  - `0` uses Foundry's standard lighting.
+  - `1` makes the tile fully ignore scene lighting.
+  - Values in between blend the lit and unlit appearances.
+- Previews changes immediately while editing a tile.
+- Preserves the tile's transform, tint, opacity, visibility, and video texture.
+- Supports both regular and overhead tiles.
+- Includes English and Russian localization.
+
+The default value is `0`, so existing tiles keep their normal appearance until
+you explicitly change the setting.
+
+## Compatibility
+
+- **Minimum Foundry VTT version:** 14
+- **Verified Foundry VTT version:** 14
+- **Required game system:** None
+- **Dependencies:** None
 
 ## Installation
 
-Copy the `tile-unlit` directory into:
+### Install from the manifest URL
 
-`FoundryVTT/Data/modules/tile-unlit`
+1. Open Foundry VTT and go to **Add-on Modules**.
+2. Click **Install Module**.
+3. Paste the following URL into **Manifest URL**:
 
-Restart Foundry and enable **Tile Unlit** in the world.
+   ```text
+   https://github.com/Oxy949/fvtt-tile-unlit/releases/latest/download/module.json
+   ```
 
-## Technical note
+4. Click **Install**, then enable **Tile Unlit** in your world.
 
-Foundry VTT 14 renders scene objects into `PrimaryCanvasGroup` and applies lighting in a later Effects pass. Core does not expose a per-tile unlit-material switch, so this module creates a small pass after lighting and mirrors opted-in Tile meshes into it. The pass is positioned dynamically relative to `canvas.effects` and `canvas.visibility` instead of relying on fixed child indexes.
+### Install manually
 
-This initial build targets Foundry VTT 14.365. Test regular and overhead tiles in your own scene before relying on it for a session, especially if another module rewrites canvas group ordering.
+1. Download `module.zip` from the
+   [latest release](https://github.com/Oxy949/fvtt-tile-unlit/releases/latest).
+2. Extract it into your Foundry VTT `Data/modules/fvtt-tile-unlit` directory.
+3. Restart Foundry VTT and enable **Tile Unlit** in your world.
 
+## Usage
 
-## 0.1.4
-- Fixed TileConfig preview objects replacing the real canvas Tile in the unlit pass.
-- Re-syncs the persistent Tile after Apply/Close.
-- Defers update synchronization until Foundry finishes refreshing the Tile mesh.
+1. Open a scene and double-click a tile to edit it.
+2. Find the **Tile Lighting** section in the tile configuration window.
+3. Adjust **Ignore Lighting**:
+   - Use `0` for normal scene lighting.
+   - Use `1` for a completely unlit tile.
+   - Use a value between `0` and `1` for a partial effect.
+4. Save the tile configuration.
 
+The value is stored on each Tile document as
+`flags.tile-unlit.ignoreLighting`.
 
-## 0.1.4
-- TileConfig preview placeables are now rendered through the unlit pass too, so simply opening tile settings no longer restores normal lighting.
-- Slider preview continues to work while editing the tile.
+## How It Works
+
+Foundry renders scene objects before applying its lighting effects. Tile Unlit
+creates a small render pass after the lighting layer and mirrors opted-in tile
+meshes into it. The original tile remains responsible for interaction, video
+playback, and Foundry's normal placeable-object behavior.
+
+The render pass is positioned relative to Foundry's effects and visibility
+groups at runtime instead of relying on fixed child indexes.
+
+## Known Limitations
+
+- The module currently targets Foundry VTT 14 only.
+- Modules that replace or significantly reorder Foundry's canvas rendering
+  groups may conflict with Tile Unlit.
+- Because the feature relies on Foundry's internal canvas structure, test
+  important scenes after updating Foundry or other rendering-related modules.
+
+If you encounter a problem, please
+[open an issue](https://github.com/Oxy949/fvtt-tile-unlit/issues) and include
+your Foundry version, game system, browser, and a list of active visual or
+canvas-related modules.
+
+## License
+
+Tile Unlit is available under the [MIT License](LICENSE).
