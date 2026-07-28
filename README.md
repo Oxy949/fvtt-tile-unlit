@@ -15,20 +15,9 @@ regardless of scene darkness, Ambient Lights, or Darkness sources.
   - `0` uses Foundry's standard lighting.
   - `1` makes the tile fully ignore scene lighting.
   - Values in between blend the lit and unlit appearances.
-- Previews changes immediately while editing a tile.
-- Preserves the tile's transform, tint, opacity, visibility, and video texture.
-- Supports both regular and overhead tiles.
-- Includes English and Russian localization.
 
 The default value is `0`, so existing tiles keep their normal appearance until
 you explicitly change the setting.
-
-## Compatibility
-
-- **Minimum Foundry VTT version:** 14
-- **Verified Foundry VTT version:** 14
-- **Required game system:** None
-- **Dependencies:** None
 
 ## Installation
 
@@ -74,13 +63,6 @@ playback, and Foundry's normal placeable-object behavior.
 The render pass is positioned relative to Foundry's effects and visibility
 groups at runtime instead of relying on fixed child indexes.
 
-## Known Limitations
-
-- The module currently targets Foundry VTT 14 only.
-- Modules that replace or significantly reorder Foundry's canvas rendering
-  groups may conflict with Tile Unlit.
-- Because the feature relies on Foundry's internal canvas structure, test
-  important scenes after updating Foundry or other rendering-related modules.
 
 If you encounter a problem, please
 [open an issue](https://github.com/Oxy949/fvtt-tile-unlit/issues) and include
