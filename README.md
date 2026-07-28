@@ -51,7 +51,7 @@ you explicitly change the setting.
 4. Save the tile configuration.
 
 The value is stored on each Tile document as
-`flags.tile-unlit.ignoreLighting`.
+`flags.fvtt-tile-unlit.ignoreLighting`.
 
 ## How It Works
 

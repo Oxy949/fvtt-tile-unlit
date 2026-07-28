@@ -1,4 +1,4 @@
-const MODULE_ID = "tile-unlit";
+const MODULE_ID = "fvtt-tile-unlit";
 const FLAG_KEY = "ignoreLighting";
 const TEMPLATE_PATH = `modules/${MODULE_ID}/templates/tile-unlit.hbs`;
 
