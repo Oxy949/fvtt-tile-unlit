@@ -2,7 +2,8 @@
   "id": "fvtt-tile-unlit",
   "title": "Tile Unlit",
   "description": "Adds a per-tile 'Ignore Lighting' options to ignore scene darkness and light-source illumination.",
-  "version": "0.1.5",
+  "version": "#{VERSION}#",
+  "library": "false",
   "authors": [
     {
       "name": "Oxy949",
@@ -13,12 +14,17 @@
     }
   ],
   "compatibility": {
-    "minimum": "14",
-    "verified": "14"
+    "minimum": 14,
+    "verified": 14
+  },
+  "relationships": {
+    "systems": [],
+    "requires": []
   },
   "esmodules": [
     "scripts/tile-unlit.js"
   ],
+  "scripts": [],
   "styles": [
     "styles/tile-unlit.css"
   ],
@@ -32,6 +38,17 @@
       "lang": "en",
       "name": "English",
       "path": "lang/en.json"
+    }
+  ],
+  "url": "#{URL}#",
+  "manifest": "#{MANIFEST}#",
+  "download": "#{DOWNLOAD}#",
+  "license": "MIT",
+  "readme": "README.md",
+  "media": [
+    {
+      "type": "icon",
+      "url": "https://avatars2.githubusercontent.com/u/71292812?s=400&u=ccdb4eeb7abf551ca8f314e5a9bfd0479a4d3d41&v=4"
     }
   ]
 }
