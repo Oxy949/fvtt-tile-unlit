@@ -1,4 +1,6 @@
 const MODULE_ID = "fvtt-tile-unlit";
+const FXMASTER_ID = "fxmaster";
+const DARKNESS_TILES_ID = "darkness-activated-tiles";
 const LIGHTING_FLAG_KEY = "ignoreLighting";
 const WEATHER_FLAG_KEY = "ignoreWeather";
 const TEMPLATE_PATH = `modules/${MODULE_ID}/templates/tile-unlit.hbs`;
@@ -25,6 +27,8 @@ class TileUnlitPass {
     /** @type {PIXI.Container|null} */
     this.root = null;
     /** @type {PIXI.Container|null} */
+    this.weatherIgnoredRoot = null;
+    /** @type {PIXI.Container|null} */
     this.weatherAffected = null;
     /** @type {PIXI.Container|null} */
     this.weatherOverlay = null;
@@ -32,10 +36,16 @@ class TileUnlitPass {
     this.weatherIgnored = null;
     /** @type {PIXI.Container|null} */
     this.weatherMask = null;
-    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, weatherOverlay: PIXI.Container, weatherMask: PIXI.Sprite, ignoreWeather: boolean, suppressedMesh?: any}>} */
+    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, weatherOverlay: PIXI.Container, weatherMask: PIXI.Sprite, ignoreWeather: boolean, suppressedMesh?: any, suppressionFilter?: PIXI.Filter|null}>} */
     this.entries = new Map();
     this._tickerBound = this._tick.bind(this);
+    this._orderingTickerBound = this._ensureRootOrdering.bind(this);
     this._tickerAttached = false;
+    this._orderingTickerAttached = false;
+    this._fxMasterState = null;
+    this._fxMasterFilters = [];
+    this._replayFXMasterParticles = false;
+    this._renderingFXMasterParticles = false;
   }
 
   get active() {
@@ -52,6 +62,12 @@ class TileUnlitPass {
     root.eventMode = "none";
     root.interactiveChildren = false;
     root.sortableChildren = true;
+
+    const weatherIgnoredRoot = new PIXI.Container();
+    weatherIgnoredRoot.name = `${MODULE_ID}.weatherIgnoredPass`;
+    weatherIgnoredRoot.eventMode = "none";
+    weatherIgnoredRoot.interactiveChildren = false;
+    weatherIgnoredRoot.sortableChildren = true;
 
     const weatherAffected = new PIXI.Container();
     weatherAffected.name = `${MODULE_ID}.weatherAffected`;
@@ -81,15 +97,16 @@ class TileUnlitPass {
     weatherMask.sortableChildren = true;
     weatherMask.zIndex = 3;
 
-    root.addChild(weatherAffected, weatherOverlay, weatherIgnored, weatherMask);
+    root.addChild(weatherAffected, weatherOverlay, weatherMask);
+    weatherIgnoredRoot.addChild(weatherIgnored);
 
     const effects = canvas.effects;
-    const visibility = canvas.visibility;
     const effectsParent = effects?.parent ?? canvas.environment ?? canvas.rendered;
 
     if (!effectsParent) {
       console.error(`${MODULE_ID} | Unable to locate a canvas container for the unlit pass.`);
       root.destroy({ children: true });
+      weatherIgnoredRoot.destroy({ children: true });
       return;
     }
 
@@ -97,44 +114,229 @@ class TileUnlitPass {
     // We calculate it dynamically rather than assuming an internal child index.
     if (effects?.parent === effectsParent) {
       const effectsIndex = effectsParent.getChildIndex(effects);
-      let insertIndex = effectsIndex + 1;
-
-      if (visibility?.parent === effectsParent) {
-        const visibilityIndex = effectsParent.getChildIndex(visibility);
-        insertIndex = Math.min(insertIndex, visibilityIndex);
-        if (visibilityIndex <= effectsIndex) insertIndex = effectsIndex + 1;
-      }
-
-      effectsParent.addChildAt(root, Math.min(insertIndex, effectsParent.children.length));
+      const insertIndex = Math.min(effectsIndex + 1, effectsParent.children.length);
+      effectsParent.addChildAt(root, insertIndex);
+      effectsParent.addChildAt(weatherIgnoredRoot, Math.min(insertIndex + 1, effectsParent.children.length));
     } else {
-      effectsParent.addChild(root);
+      effectsParent.addChild(root, weatherIgnoredRoot);
     }
 
     this.root = root;
+    this.weatherIgnoredRoot = weatherIgnoredRoot;
     this.weatherAffected = weatherAffected;
     this.weatherOverlay = weatherOverlay;
     this.weatherIgnored = weatherIgnored;
     this.weatherMask = weatherMask;
     this.rebuild();
     this._attachTicker();
+    this._ensureRootOrdering();
 
     console.info(`${MODULE_ID} | Unlit render pass created.`);
   }
 
   _attachTicker() {
-    if (this._tickerAttached || !canvas?.app?.ticker) return;
-    canvas.app.ticker.add(this._tickerBound);
-    this._tickerAttached = true;
+    const ticker = canvas?.app?.ticker;
+    if (!ticker) return;
+
+    if (!this._tickerAttached) {
+      ticker.add(this._tickerBound);
+      this._tickerAttached = true;
+    }
+
+    // FXMaster maintains its compositor placement at a low ticker priority.
+    // Run one ordering-only callback immediately afterwards so an opted-out
+    // tile remains above "Display Effects over Vision" output as well.
+    if (!this._orderingTickerAttached) {
+      const lowPriority = PIXI.UPDATE_PRIORITY?.LOW ?? -25;
+      ticker.add(this._orderingTickerBound, this, lowPriority - 1);
+      this._orderingTickerAttached = true;
+    }
   }
 
   _detachTicker() {
-    if (!this._tickerAttached) return;
+    if (!this._tickerAttached && !this._orderingTickerAttached) return;
     try {
       canvas?.app?.ticker?.remove(this._tickerBound);
+      canvas?.app?.ticker?.remove(this._orderingTickerBound, this);
     } catch (error) {
       console.debug(`${MODULE_ID} | Ticker was already unavailable during teardown.`, error);
     }
     this._tickerAttached = false;
+    this._orderingTickerAttached = false;
+  }
+
+  _isModuleActive(id) {
+    return game?.modules?.get?.(id)?.active === true;
+  }
+
+  _getFXMasterSetting(key) {
+    if (!this._isModuleActive(FXMASTER_ID)) return false;
+    try {
+      return game.settings.get(FXMASTER_ID, key) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  _invalidateFXMasterState() {
+    this._fxMasterState = null;
+  }
+
+  _getFXMasterState() {
+    if (this._fxMasterState) return this._fxMasterState;
+
+    const active = this._isModuleActive(FXMASTER_ID);
+    const enabled = active
+      && this._getFXMasterSetting("enable")
+      && !this._getFXMasterSetting("disableAll");
+    this._fxMasterState = {
+      enabled,
+      displaysOverVision: enabled && this._getFXMasterSetting("displayEffectsOverVision")
+    };
+    return this._fxMasterState;
+  }
+
+  _isFXMasterEnabled() {
+    return this._getFXMasterState().enabled;
+  }
+
+  _getFXMasterCompositor() {
+    try {
+      return globalThis.CONFIG?.fxmaster?.getGlobalEffectsCompositor?.() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  _getFXMasterOutputContainer() {
+    const compositor = this._getFXMasterCompositor();
+    return compositor?._displayContainer
+      ?? canvas?.rendered?.children?.find?.(child => child?.name === "fxmasterGlobalEffectsOutputContainer")
+      ?? null;
+  }
+
+  _fxMasterDisplaysOverVision() {
+    return this._getFXMasterState().displaysOverVision;
+  }
+
+  _fxMasterOutputIsVisible() {
+    if (!this._fxMasterDisplaysOverVision()) return false;
+
+    const output = this._getFXMasterOutputContainer();
+    if (!output || output.destroyed || output.parent !== canvas?.rendered) return false;
+    if (output.visible === false || output.renderable === false) return false;
+
+    const sprite = output.children?.find?.(child => child?.name === "fxmasterGlobalEffectsOutput");
+    return !sprite || (sprite.visible !== false && sprite.renderable !== false && sprite.alpha > 0);
+  }
+
+  _moveAfter(child, anchor) {
+    const parent = anchor?.parent;
+    if (!child || !parent || child === anchor) return;
+
+    try {
+      child.parent?.removeChild?.(child);
+      const index = parent.getChildIndex(anchor) + 1;
+      parent.addChildAt(child, Math.min(index, parent.children.length));
+    } catch (error) {
+      console.debug(`${MODULE_ID} | Failed to adjust compatibility render order.`, error);
+    }
+  }
+
+  _ensureAfterEffectsBeforeVisibility(child, afterChild = null) {
+    const effects = canvas?.effects;
+    const visibility = canvas?.visibility;
+    const parent = effects?.parent ?? canvas?.environment ?? canvas?.rendered;
+    if (!child || !parent) return;
+
+    const anchor = afterChild?.parent === parent ? afterChild : effects?.parent === parent ? effects : null;
+    if (!anchor) {
+      if (child.parent !== parent) parent.addChild(child);
+      return;
+    }
+
+    if (child.parent === parent) {
+      const childIndex = parent.getChildIndex(child);
+      const anchorIndex = parent.getChildIndex(anchor);
+      const visibilityIndex = visibility?.parent === parent ? parent.getChildIndex(visibility) : -1;
+      if (childIndex > anchorIndex && (visibilityIndex < 0 || childIndex < visibilityIndex)) return;
+    }
+
+    this._moveAfter(child, anchor);
+  }
+
+  /** Keep the two passes on the correct sides of FXMaster's optional output. */
+  _ensureRootOrdering() {
+    if (!this.root || this.root.destroyed || !this.weatherIgnoredRoot || this.weatherIgnoredRoot.destroyed) return;
+
+    this._ensureAfterEffectsBeforeVisibility(this.root);
+
+    const fxOutput = this._getFXMasterOutputContainer();
+    if (this._fxMasterOutputIsVisible() && fxOutput?.parent) {
+      const parent = fxOutput.parent;
+      const interfaceGroup = canvas?.interface;
+      const outputIndex = parent.getChildIndex(fxOutput);
+      const ignoredIndex = this.weatherIgnoredRoot.parent === parent
+        ? parent.getChildIndex(this.weatherIgnoredRoot)
+        : -1;
+      const interfaceIndex = interfaceGroup?.parent === parent ? parent.getChildIndex(interfaceGroup) : -1;
+      const correctlyPlaced = ignoredIndex > outputIndex && (interfaceIndex < 0 || ignoredIndex < interfaceIndex);
+      if (!correctlyPlaced) this._moveAfter(this.weatherIgnoredRoot, fxOutput);
+      return;
+    }
+
+    this._ensureAfterEffectsBeforeVisibility(this.weatherIgnoredRoot, this.root);
+  }
+
+  _getFXMasterFilters() {
+    if (!this._isFXMasterEnabled()) return [];
+
+    const sceneManager = globalThis.FXMASTER?.filters ?? null;
+    const regionLayer = canvas?.filtereffects ?? null;
+    const compositor = this._getFXMasterCompositor();
+    const rows = Array.isArray(compositor?._stackRowsFrame) ? compositor._stackRowsFrame : [];
+    const filters = [];
+    const seen = new Set();
+    const add = filter => {
+      if (!filter || filter.destroyed || filter.enabled === false || seen.has(filter)) return;
+      seen.add(filter);
+      filters.push(filter);
+    };
+
+    // FXMaster stores the UI stack top-to-bottom and composites it in reverse.
+    for (let index = rows.length - 1; index >= 0; index--) {
+      const row = rows[index];
+      if (row?.kind !== "filter" || !row.uid) continue;
+      add(sceneManager?.getStackFilter?.(row.uid) ?? regionLayer?.getStackFilter?.(row.uid));
+    }
+
+    // During the first compositor frame the ordered row cache is not populated
+    // yet. Use the live registries as a one-frame fallback.
+    if (!filters.length) {
+      for (const entry of sceneManager?.stackEntries?.values?.() ?? []) add(entry?.filter);
+      for (const entry of regionLayer?.stackEntries?.values?.() ?? []) add(entry?.filter);
+    }
+
+    return filters;
+  }
+
+  _syncFXMasterCompatibility() {
+    if (!this.root || this.root.destroyed) return;
+
+    // When FXMaster presents over vision it captures this pass itself. In its
+    // normal primary-group mode, apply the live filter runtimes here and replay
+    // particle slots below so unlit tiles do not accidentally cover them.
+    const letFXMasterCapturePass = this._fxMasterDisplaysOverVision();
+    this._replayFXMasterParticles = this._isFXMasterEnabled() && !letFXMasterCapturePass;
+    const filters = letFXMasterCapturePass ? [] : this._getFXMasterFilters();
+    const unchanged = filters.length === this._fxMasterFilters.length
+      && filters.every((filter, index) => filter === this._fxMasterFilters[index]);
+
+    if (!unchanged) {
+      this.root.filters = filters.length ? filters : null;
+      this.root.filterArea = filters.length ? canvas?.app?.renderer?.screen ?? null : null;
+      this._fxMasterFilters = filters;
+    }
   }
 
   rebuild() {
@@ -208,7 +410,15 @@ class TileUnlitPass {
       weatherOverlay.addChild(weatherReplay);
       this.weatherOverlay.addChild(weatherOverlay);
 
-      entry = { tile, sprite, weatherOverlay, weatherMask, ignoreWeather, suppressedMesh: null };
+      entry = {
+        tile,
+        sprite,
+        weatherOverlay,
+        weatherMask,
+        ignoreWeather,
+        suppressedMesh: null,
+        suppressionFilter: null
+      };
       this.entries.set(tile.id, entry);
     }
 
@@ -237,17 +447,73 @@ class TileUnlitPass {
 
     // If the visual source changed (usually original -> config preview), restore
     // any mesh we suppressed on the previous source before suppressing the new
-    // one. This avoids leaking renderable=false across the preview lifecycle.
-    if (entry.suppressedMesh && entry.suppressedMesh !== mesh && !entry.suppressedMesh.destroyed) {
-      entry.suppressedMesh.renderable = true;
-      entry.suppressedMesh = null;
+    // one. This avoids leaking suppression across the preview lifecycle.
+    if (entry.suppressedMesh && entry.suppressedMesh !== mesh) {
+      this._releaseMeshSuppression(entry, entry.suppressedMesh);
     }
 
     // Fractional values are a normal-lit base plus an unlit copy. At 1.0 the
     // base mesh, including TileConfig's preview mesh, must not be drawn at all.
-    mesh.renderable = strength < 1;
-    if (strength >= 1) entry.suppressedMesh = mesh;
-    else if (entry.suppressedMesh === mesh) entry.suppressedMesh = null;
+    // Prefer a transparent PIXI filter over renderable=false: FXMaster needs a
+    // live, renderable source mesh for its tile/weather masks, while Darkness
+    // Activated Tiles animates mesh.alpha directly during fade transitions.
+    if (strength >= 1) this._suppressMesh(entry, mesh);
+    else this._releaseMeshSuppression(entry, mesh);
+  }
+
+  _createSuppressionFilter() {
+    const AlphaFilter = PIXI.AlphaFilter ?? PIXI.filters?.AlphaFilter;
+
+    try {
+      const filter = AlphaFilter
+        ? new AlphaFilter(0)
+        : PIXI.Filter
+          ? new PIXI.Filter(undefined, `
+              varying vec2 vTextureCoord;
+              uniform sampler2D uSampler;
+              void main(void) { gl_FragColor = vec4(0.0); }
+            `)
+          : null;
+      if (!filter) return null;
+      if ("alpha" in filter) filter.alpha = 0;
+      filter.__tileUnlitSuppression = true;
+      return filter;
+    } catch (error) {
+      console.debug(`${MODULE_ID} | A transparent PIXI filter is unavailable; using renderable suppression.`, error);
+      return null;
+    }
+  }
+
+  _suppressMesh(entry, mesh) {
+    if (!mesh || mesh.destroyed) return;
+
+    entry.suppressionFilter ??= this._createSuppressionFilter();
+    const filter = entry.suppressionFilter;
+    if (!filter || filter.destroyed) {
+      mesh.renderable = false;
+      entry.suppressedMesh = mesh;
+      return;
+    }
+
+    const filters = Array.isArray(mesh.filters) ? mesh.filters.filter(Boolean) : [];
+    if (!filters.includes(filter)) mesh.filters = [...filters, filter];
+    mesh.renderable = true;
+    entry.suppressedMesh = mesh;
+  }
+
+  _releaseMeshSuppression(entry, mesh = entry.suppressedMesh) {
+    if (!mesh) return;
+
+    const filter = entry.suppressionFilter;
+    if (!mesh.destroyed) {
+      if (filter && Array.isArray(mesh.filters) && mesh.filters.includes(filter)) {
+        const filters = mesh.filters.filter(candidate => candidate !== filter);
+        mesh.filters = filters.length ? filters : null;
+      }
+      mesh.renderable = true;
+    }
+
+    if (entry.suppressedMesh === mesh) entry.suppressedMesh = null;
   }
 
   /**
@@ -339,9 +605,66 @@ class TileUnlitPass {
   }
 
   _renderWeather(renderer) {
+    if (!this.weatherOverlay?.visible) return;
+
     const weather = canvas?.weather;
-    if (!this.weatherOverlay?.visible || !weather || weather.destroyed) return;
-    weather.render(renderer);
+    if (weather && !weather.destroyed) weather.render(renderer);
+    if (this._replayFXMasterParticles) this._renderFXMasterParticles(renderer);
+  }
+
+  /** Replay FXMaster's transparent particle slots inside the active tile mask. */
+  _renderFXMasterParticles(renderer) {
+    const layer = canvas?.particleeffects;
+    if (this._renderingFXMasterParticles || !renderer || !layer?.stackEntries?.size) return;
+
+    const entries = [...layer.stackEntries.values()]
+      .filter(entry => entry?.root && entry?.slot && !entry.root.destroyed && !entry.slot.destroyed)
+      .sort((a, b) => {
+        const az = Number(a.slot?.zIndex ?? a.zIndex ?? 0);
+        const bz = Number(b.slot?.zIndex ?? b.zIndex ?? 0);
+        return az - bz;
+      });
+
+    this._renderingFXMasterParticles = true;
+    try {
+      for (const entry of entries) {
+        const { root, slot } = entry;
+        const runtime = entry.fx;
+        const container = entry.container ?? slot;
+        if (runtime?.destroyed || (runtime && "enabled" in runtime && runtime.enabled === false)) continue;
+        if (container?.visible === false) continue;
+
+        const candidates = layer._stackRoots?.get?.(root) ?? new Set([slot]);
+        const previousCandidates = [];
+        const previousRoot = { visible: root.visible, renderable: root.renderable };
+
+        try {
+          for (const candidate of candidates) {
+            if (!candidate || candidate.destroyed) continue;
+            previousCandidates.push([candidate, candidate.visible, candidate.renderable]);
+            const show = candidate === slot;
+            candidate.visible = show;
+            candidate.renderable = show;
+          }
+
+          root.visible = true;
+          root.renderable = true;
+          root.render(renderer);
+        } catch (error) {
+          console.debug(`${MODULE_ID} | Failed to replay an FXMaster particle slot.`, error);
+        } finally {
+          root.visible = previousRoot.visible;
+          root.renderable = previousRoot.renderable;
+          for (const [candidate, visible, renderable] of previousCandidates) {
+            if (!candidate || candidate.destroyed) continue;
+            candidate.visible = visible;
+            candidate.renderable = renderable;
+          }
+        }
+      }
+    } finally {
+      this._renderingFXMasterParticles = false;
+    }
   }
 
   _updateWeatherOverlayVisibility() {
@@ -357,9 +680,13 @@ class TileUnlitPass {
     if (entry) {
       this.entries.delete(id);
 
-      if (entry.suppressedMesh && !entry.suppressedMesh.destroyed) {
-        entry.suppressedMesh.renderable = true;
+      this._releaseMeshSuppression(entry);
+      try {
+        entry.suppressionFilter?.destroy?.();
+      } catch (error) {
+        console.debug(`${MODULE_ID} | Failed to destroy a mesh suppression filter.`, error);
       }
+      entry.suppressionFilter = null;
 
       entry.weatherOverlay.mask = null;
       for (const object of [entry.sprite, entry.weatherOverlay, entry.weatherMask]) {
@@ -383,6 +710,8 @@ class TileUnlitPass {
 
   _tick() {
     if (!this.root || this.root.destroyed) return;
+
+    this._syncFXMasterCompatibility();
 
     for (const [id, entry] of this.entries) {
       const tile = entry.tile;
@@ -415,6 +744,8 @@ class TileUnlitPass {
 
     if (this.root && !this.root.destroyed) {
       try {
+        this.root.filters = null;
+        this.root.filterArea = null;
         this.root.parent?.removeChild(this.root);
         this.root.destroy({ children: true });
       } catch (error) {
@@ -422,11 +753,25 @@ class TileUnlitPass {
       }
     }
 
+    if (this.weatherIgnoredRoot && !this.weatherIgnoredRoot.destroyed) {
+      try {
+        this.weatherIgnoredRoot.parent?.removeChild(this.weatherIgnoredRoot);
+        this.weatherIgnoredRoot.destroy({ children: true });
+      } catch (error) {
+        console.debug(`${MODULE_ID} | Error while destroying weather-ignored pass.`, error);
+      }
+    }
+
     this.root = null;
+    this.weatherIgnoredRoot = null;
     this.weatherAffected = null;
     this.weatherOverlay = null;
     this.weatherIgnored = null;
     this.weatherMask = null;
+    this._fxMasterFilters = [];
+    this._fxMasterState = null;
+    this._replayFXMasterParticles = false;
+    this._renderingFXMasterParticles = false;
   }
 }
 
@@ -437,12 +782,17 @@ Hooks.once("init", () => {
 });
 
 Hooks.on("canvasReady", () => {
+  unlitPass._invalidateFXMasterState();
   unlitPass.createRoot();
 });
 
 Hooks.on("canvasTearDown", () => {
   unlitPass.destroy();
 });
+
+for (const hookName of ["updateSetting", "createSetting", "clientSettingChanged"]) {
+  Hooks.on(hookName, () => unlitPass._invalidateFXMasterState());
+}
 
 Hooks.on("createTile", (document) => {
   queueMicrotask(() => {
@@ -463,6 +813,14 @@ Hooks.on("updateTile", (document) => {
 
 Hooks.on("deleteTile", (document) => {
   unlitPass.removeTile(document.id, document.object);
+});
+
+// Darkness Activated Tiles starts its fade animations from lightingRefresh and
+// writes every intermediate value to the live mesh alpha. Rebuild after its
+// hook turn, then let the normal ticker mirror the animation frame-for-frame.
+Hooks.on("lightingRefresh", () => {
+  if (game?.modules?.get?.(DARKNESS_TILES_ID)?.active !== true) return;
+  requestAnimationFrame(() => unlitPass.rebuild());
 });
 
 // A generic object refresh catches local previews and core-side refreshes which

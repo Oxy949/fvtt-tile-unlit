@@ -58,12 +58,32 @@ The values are stored on each Tile document as
 `flags.fvtt-tile-unlit.ignoreLighting` and
 `flags.fvtt-tile-unlit.ignoreWeather`.
 
+## Module Compatibility
+
+- **[Gambit's FXMaster 8](https://github.com/gambit07/fxmaster):** when
+  **Ignore Weather** is disabled, active FXMaster particle and filter effects
+  are included in the weather-affected pass. When it is enabled, the tile is
+  kept above FXMaster output, including the optional **Display Effects over
+  Vision** mode. FXMaster's **Restricts Weather**, **Restricts Particles**, and
+  **Restricts Filters** tile masks keep using the original live tile mesh.
+- **[Darkness Activated Tiles](https://github.com/Oxy949/DarknessActivatedTiles):**
+  visibility changes and configured fade transitions are mirrored from the
+  live tile mesh, so a tile can be both darkness-activated and partially or
+  fully unlit.
+
+Both integrations are optional and activate automatically when the respective
+module is enabled; no compatibility setting is required.
+
 ## How It Works
 
 Foundry renders scene objects before applying its lighting effects. Tile Unlit
 creates a small render pass after the lighting layer and mirrors opted-in tile
 meshes into it. The original tile remains responsible for interaction, video
 playback, and Foundry's normal placeable-object behavior.
+
+At full strength the original mesh is made transparent without removing it
+from the render tree. This lets canvas modules continue to inspect it for
+weather masks and animate its live alpha while Tile Unlit draws the unlit copy.
 
 The render pass is positioned relative to Foundry's effects and visibility
 groups at runtime instead of relying on fixed child indexes.

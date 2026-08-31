@@ -4,6 +4,6 @@
     "IgnoreLighting": "Ignore Lighting",
     "IgnoreLightingHint": "0 — normal lighting. 1 — fully ignore scene lighting.",
     "IgnoreWeather": "Ignore Weather",
-    "IgnoreWeatherHint": "When enabled, the tile is displayed above scene weather effects."
+    "IgnoreWeatherHint": "When enabled, the tile is displayed above core weather and supported FXMaster effects."
   }
 }
