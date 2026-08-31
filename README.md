@@ -11,6 +11,8 @@ regardless of scene darkness, Ambient Lights, or Darkness sources.
 ## Features
 
 - Controls lighting independently for each tile.
+- Can keep individual unlit tiles above scene weather effects. This is enabled
+  by default to preserve the module's previous behavior.
 - Offers an adjustable effect strength from `0` to `1`:
   - `0` uses Foundry's standard lighting.
   - `1` makes the tile fully ignore scene lighting.
@@ -48,10 +50,13 @@ you explicitly change the setting.
    - Use `0` for normal scene lighting.
    - Use `1` for a completely unlit tile.
    - Use a value between `0` and `1` for a partial effect.
-4. Save the tile configuration.
+4. Leave **Ignore Weather** enabled to display the unlit tile above weather,
+   or disable it to keep weather visible over the tile.
+5. Save the tile configuration.
 
-The value is stored on each Tile document as
-`flags.fvtt-tile-unlit.ignoreLighting`.
+The values are stored on each Tile document as
+`flags.fvtt-tile-unlit.ignoreLighting` and
+`flags.fvtt-tile-unlit.ignoreWeather`.
 
 ## How It Works
 

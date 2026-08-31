@@ -2,6 +2,8 @@
   "TILEUNLIT": {
     "Category": "Tile Lighting",
     "IgnoreLighting": "Ignore Lighting",
-    "IgnoreLightingHint": "0 — normal lighting. 1 — fully ignore scene lighting."
+    "IgnoreLightingHint": "0 — normal lighting. 1 — fully ignore scene lighting.",
+    "IgnoreWeather": "Ignore Weather",
+    "IgnoreWeatherHint": "When enabled, the tile is displayed above scene weather effects."
   }
 }

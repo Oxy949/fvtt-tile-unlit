@@ -1,11 +1,12 @@
 const MODULE_ID = "fvtt-tile-unlit";
-const FLAG_KEY = "ignoreLighting";
+const LIGHTING_FLAG_KEY = "ignoreLighting";
+const WEATHER_FLAG_KEY = "ignoreWeather";
 const TEMPLATE_PATH = `modules/${MODULE_ID}/templates/tile-unlit.hbs`;
 
 let tileConfigTemplatePromise = null;
 
 // TileConfig V14 renders edits through a temporary preview Placeable. Keep
-// track of the active sheet and its current custom slider value so our pass
+// track of the active sheet and its current custom control values so our pass
 // follows the preview instead of letting Foundry draw a normally-lit clone.
 const configPreviewState = new Map();
 
@@ -23,7 +24,15 @@ class TileUnlitPass {
   constructor() {
     /** @type {PIXI.Container|null} */
     this.root = null;
-    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, suppressedMesh?: any}>} */
+    /** @type {PIXI.Container|null} */
+    this.weatherAffected = null;
+    /** @type {PIXI.Container|null} */
+    this.weatherOverlay = null;
+    /** @type {PIXI.Container|null} */
+    this.weatherIgnored = null;
+    /** @type {PIXI.Container|null} */
+    this.weatherMask = null;
+    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, weatherOverlay: PIXI.Container, weatherMask: PIXI.Sprite, ignoreWeather: boolean, suppressedMesh?: any}>} */
     this.entries = new Map();
     this._tickerBound = this._tick.bind(this);
     this._tickerAttached = false;
@@ -43,6 +52,36 @@ class TileUnlitPass {
     root.eventMode = "none";
     root.interactiveChildren = false;
     root.sortableChildren = true;
+
+    const weatherAffected = new PIXI.Container();
+    weatherAffected.name = `${MODULE_ID}.weatherAffected`;
+    weatherAffected.eventMode = "none";
+    weatherAffected.interactiveChildren = false;
+    weatherAffected.sortableChildren = true;
+    weatherAffected.zIndex = 0;
+
+    const weatherOverlay = new PIXI.Container();
+    weatherOverlay.name = `${MODULE_ID}.weatherOverlay`;
+    weatherOverlay.eventMode = "none";
+    weatherOverlay.interactiveChildren = false;
+    weatherOverlay.visible = false;
+    weatherOverlay.zIndex = 1;
+
+    const weatherIgnored = new PIXI.Container();
+    weatherIgnored.name = `${MODULE_ID}.weatherIgnored`;
+    weatherIgnored.eventMode = "none";
+    weatherIgnored.interactiveChildren = false;
+    weatherIgnored.sortableChildren = true;
+    weatherIgnored.zIndex = 2;
+
+    const weatherMask = new PIXI.Container();
+    weatherMask.name = `${MODULE_ID}.weatherMask`;
+    weatherMask.eventMode = "none";
+    weatherMask.interactiveChildren = false;
+    weatherMask.sortableChildren = true;
+    weatherMask.zIndex = 3;
+
+    root.addChild(weatherAffected, weatherOverlay, weatherIgnored, weatherMask);
 
     const effects = canvas.effects;
     const visibility = canvas.visibility;
@@ -72,6 +111,10 @@ class TileUnlitPass {
     }
 
     this.root = root;
+    this.weatherAffected = weatherAffected;
+    this.weatherOverlay = weatherOverlay;
+    this.weatherIgnored = weatherIgnored;
+    this.weatherMask = weatherMask;
     this.rebuild();
     this._attachTicker();
 
@@ -130,6 +173,7 @@ class TileUnlitPass {
     const visualTile = this._getVisualTile(tile);
     const mesh = visualTile?.mesh;
     if (!mesh?.texture) return;
+    const ignoreWeather = this._getEffectiveIgnoreWeather(tile);
 
     let entry = this.entries.get(tile.id);
     if (!entry || entry.tile !== tile || entry.sprite.destroyed) {
@@ -139,21 +183,57 @@ class TileUnlitPass {
       sprite.name = `${MODULE_ID}.${tile.id}`;
       sprite.eventMode = "none";
       sprite.interactiveChildren = false;
-      this.root.addChild(sprite);
 
-      entry = { tile, sprite, suppressedMesh: null };
+      const weatherMask = new PIXI.Sprite(mesh.texture);
+      weatherMask.name = `${MODULE_ID}.${tile.id}.weatherMask`;
+      weatherMask.eventMode = "none";
+      weatherMask.interactiveChildren = false;
+      this.weatherMask.addChild(weatherMask);
+
+      // A display object may be rendered more than once per frame. Replay the
+      // live Foundry weather layer through this tile's alpha-aware sprite mask
+      // so custom and animated weather effects remain supported.
+      const weatherOverlay = new PIXI.Container();
+      weatherOverlay.name = `${MODULE_ID}.${tile.id}.weatherOverlay`;
+      weatherOverlay.eventMode = "none";
+      weatherOverlay.interactiveChildren = false;
+      weatherOverlay.visible = false;
+      weatherOverlay.mask = weatherMask;
+
+      const weatherReplay = new PIXI.Container();
+      weatherReplay.name = `${MODULE_ID}.${tile.id}.weatherReplay`;
+      weatherReplay.eventMode = "none";
+      weatherReplay.interactiveChildren = false;
+      weatherReplay._render = renderer => this._renderWeather(renderer);
+      weatherOverlay.addChild(weatherReplay);
+      this.weatherOverlay.addChild(weatherOverlay);
+
+      entry = { tile, sprite, weatherOverlay, weatherMask, ignoreWeather, suppressedMesh: null };
       this.entries.set(tile.id, entry);
     }
 
-    this._syncEntry(entry, visualTile, strength);
+    this._syncEntry(entry, visualTile, strength, ignoreWeather);
   }
 
-  _syncEntry(entry, visualTile, strength) {
+  _syncEntry(entry, visualTile, strength, ignoreWeather) {
     const mesh = visualTile?.mesh;
     if (!mesh?.texture || entry.sprite.destroyed) return;
 
     if (entry.sprite.texture !== mesh.texture) entry.sprite.texture = mesh.texture;
     this._copyMeshState(visualTile, entry.sprite, strength);
+
+    const spriteContainer = ignoreWeather ? this.weatherIgnored : this.weatherAffected;
+    if (entry.sprite.parent !== spriteContainer) spriteContainer.addChild(entry.sprite);
+    entry.ignoreWeather = ignoreWeather;
+
+    if (!entry.weatherMask.destroyed) {
+      if (entry.weatherMask.texture !== mesh.texture) entry.weatherMask.texture = mesh.texture;
+      this._copyMeshState(visualTile, entry.weatherMask, strength);
+      entry.weatherMask.tint = 0xFFFFFF;
+      entry.weatherMask.visible = !ignoreWeather && entry.sprite.visible && (entry.sprite.alpha > 0);
+    }
+    entry.weatherOverlay.visible = entry.weatherMask.visible;
+    this._updateWeatherOverlayVisibility();
 
     // If the visual source changed (usually original -> config preview), restore
     // any mesh we suppressed on the previous source before suppressing the new
@@ -199,6 +279,12 @@ class TileUnlitPass {
     return this._getStrength(tile.document);
   }
 
+  _getEffectiveIgnoreWeather(tile) {
+    const state = configPreviewState.get(tile.id);
+    if (state && (typeof state.ignoreWeather === "boolean")) return state.ignoreWeather;
+    return this._getIgnoreWeather(tile.document);
+  }
+
   _clampStrength(value) {
     value = Number(value);
     if (!Number.isFinite(value)) return 0;
@@ -223,7 +309,13 @@ class TileUnlitPass {
 
     if (sprite.anchor && mesh.anchor) sprite.anchor.copyFrom(mesh.anchor);
 
-    sprite.alpha = mesh.alpha * strength;
+    // Tile opacity is applied by Foundry's PrimarySpriteMesh occlusion shader
+    // through unoccludedAlpha, so it is not included in mesh.alpha. Our plain
+    // PIXI.Sprite has no such shader and must apply that opacity explicitly.
+    // Prefer the live mesh value so TileConfig previews and other live canvas
+    // adjustments are mirrored, with the document value as a safe fallback.
+    const tileAlpha = this._clampStrength(mesh.unoccludedAlpha ?? tile.document?.alpha ?? 1);
+    sprite.alpha = mesh.alpha * tileAlpha * strength;
     sprite.tint = mesh.tint ?? 0xFFFFFF;
     sprite.blendMode = mesh.blendMode;
     // Let Foundry decide whether the Placeable is visible (including GM handling
@@ -237,7 +329,24 @@ class TileUnlitPass {
   }
 
   _getStrength(document) {
-    return this._clampStrength(document?.getFlag?.(MODULE_ID, FLAG_KEY) ?? 0);
+    return this._clampStrength(document?.getFlag?.(MODULE_ID, LIGHTING_FLAG_KEY) ?? 0);
+  }
+
+  _getIgnoreWeather(document) {
+    // Missing flags belong to tiles created before this option existed. Treat
+    // them as enabled so the module keeps its previous weather behaviour.
+    return document?.getFlag?.(MODULE_ID, WEATHER_FLAG_KEY) !== false;
+  }
+
+  _renderWeather(renderer) {
+    const weather = canvas?.weather;
+    if (!this.weatherOverlay?.visible || !weather || weather.destroyed) return;
+    weather.render(renderer);
+  }
+
+  _updateWeatherOverlayVisibility() {
+    if (!this.weatherOverlay) return;
+    this.weatherOverlay.visible = [...this.entries.values()].some(entry => entry.weatherOverlay.visible);
   }
 
   /** @param {string} id @param {any} [tileHint] */
@@ -252,11 +361,16 @@ class TileUnlitPass {
         entry.suppressedMesh.renderable = true;
       }
 
-      try {
-        entry.sprite.destroy({ children: true, texture: false, baseTexture: false });
-      } catch (error) {
-        console.warn(`${MODULE_ID} | Failed to destroy unlit sprite ${id}.`, error);
+      entry.weatherOverlay.mask = null;
+      for (const object of [entry.sprite, entry.weatherOverlay, entry.weatherMask]) {
+        try {
+          object.destroy({ children: true, texture: false, baseTexture: false });
+        } catch (error) {
+          console.warn(`${MODULE_ID} | Failed to destroy an unlit render object for ${id}.`, error);
+        }
       }
+
+      this._updateWeatherOverlayVisibility();
     }
 
     // Ask core to resume drawing the real mesh. Setting renderable first makes
@@ -287,7 +401,7 @@ class TileUnlitPass {
 
       const visualTile = this._getVisualTile(tile);
       if (!visualTile?.mesh || visualTile.mesh.destroyed) continue;
-      this._syncEntry(entry, visualTile, strength);
+      this._syncEntry(entry, visualTile, strength, this._getEffectiveIgnoreWeather(tile));
     }
   }
 
@@ -309,6 +423,10 @@ class TileUnlitPass {
     }
 
     this.root = null;
+    this.weatherAffected = null;
+    this.weatherOverlay = null;
+    this.weatherIgnored = null;
+    this.weatherMask = null;
   }
 }
 
@@ -382,13 +500,14 @@ Hooks.on("renderTileConfig", async (app, html) => {
   const root = html instanceof jQuery ? html[0] : html;
   if (!root?.querySelector) return;
 
-  const rawValue = Number(document.getFlag(MODULE_ID, FLAG_KEY) ?? 0);
+  const rawValue = Number(document.getFlag(MODULE_ID, LIGHTING_FLAG_KEY) ?? 0);
   const numericValue = Number.isFinite(rawValue) ? Math.min(1, Math.max(0, rawValue)) : 0;
   const value = numericValue.toFixed(1);
+  const ignoreWeather = document.getFlag(MODULE_ID, WEATHER_FLAG_KEY) !== false;
 
   // Register the config session before doing any DOM work. TileConfig may have
   // already initialized its preview by the time this hook fires.
-  configPreviewState.set(document.id, { app, strength: numericValue });
+  configPreviewState.set(document.id, { app, strength: numericValue, ignoreWeather });
   const canonicalTile = canvas?.tiles?.get?.(document.id) ?? document.object;
   if (canonicalTile) unlitPass.syncTile(canonicalTile);
 
@@ -397,7 +516,7 @@ Hooks.on("renderTileConfig", async (app, html) => {
   try {
     tileConfigTemplatePromise ??= foundry.applications.handlebars.getTemplate(TEMPLATE_PATH);
     const template = await tileConfigTemplatePromise;
-    const injectHtml = template({ value });
+    const injectHtml = template({ value, ignoreWeather });
 
     // The sheet may have been closed while the template was loading.
     if (!root.isConnected || root.querySelector(`[data-${MODULE_ID}]`)) return;
@@ -425,13 +544,22 @@ Hooks.on("renderTileConfig", async (app, html) => {
     else form.insertAdjacentHTML("beforeend", injectHtml);
 
     const fieldset = root.querySelector(`[data-${MODULE_ID}]`);
-    const input = fieldset?.querySelector('range-picker');
+    const lightingInput = fieldset?.querySelector('range-picker');
+    const weatherInput = fieldset?.querySelector(`[name="flags.${MODULE_ID}.${WEATHER_FLAG_KEY}"]`);
 
-    input?.addEventListener("input", () => {
-      const numeric = Number(input.value);
+    lightingInput?.addEventListener("input", () => {
+      const numeric = Number(lightingInput.value);
 
       const state = configPreviewState.get(document.id);
       if (state && Number.isFinite(numeric)) state.strength = Math.min(1, Math.max(0, numeric));
+
+      const tile = canvas?.tiles?.get?.(document.id) ?? document.object;
+      if (tile) unlitPass.syncTile(tile);
+    });
+
+    weatherInput?.addEventListener("input", () => {
+      const state = configPreviewState.get(document.id);
+      if (state) state.ignoreWeather = weatherInput.checked;
 
       const tile = canvas?.tiles?.get?.(document.id) ?? document.object;
       if (tile) unlitPass.syncTile(tile);

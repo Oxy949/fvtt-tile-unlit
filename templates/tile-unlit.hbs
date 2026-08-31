@@ -14,4 +14,15 @@
     </div>
     <p class="hint">{{ localize "TILEUNLIT.IgnoreLightingHint" }}</p>
   </div>
+
+  <div class="form-group">
+    <label>{{ localize "TILEUNLIT.IgnoreWeather" }}</label>
+    <div class="form-fields">
+      <input
+        type="checkbox"
+        name="flags.fvtt-tile-unlit.ignoreWeather"
+        {{checked ignoreWeather}}>
+    </div>
+    <p class="hint">{{ localize "TILEUNLIT.IgnoreWeatherHint" }}</p>
+  </div>
 </fieldset>
