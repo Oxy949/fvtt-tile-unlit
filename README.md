@@ -88,6 +88,10 @@ weather masks and animate its live alpha while Tile Unlit draws the unlit copy.
 The render pass is positioned relative to Foundry's effects and visibility
 groups at runtime instead of relying on fixed child indexes.
 
+Normally-lit tiles above an unlit tile mask its post-lighting copy, following
+Foundry's elevation and sort order. The mask uses the covering tile's texture
+alpha and live opacity, so transparent areas remain see-through.
+
 
 If you encounter a problem, please
 [open an issue](https://github.com/Oxy949/fvtt-tile-unlit/issues) and include

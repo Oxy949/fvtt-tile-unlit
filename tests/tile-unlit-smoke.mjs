@@ -83,14 +83,21 @@ class Sprite extends Container {
   }
 }
 
-class AlphaFilter {
-  constructor(alpha = 1) {
-    this.alpha = alpha;
+class Filter {
+  constructor(vertex, fragment, uniforms = {}) {
+    this.uniforms = uniforms;
     this.destroyed = false;
   }
 
   destroy() {
     this.destroyed = true;
+  }
+}
+
+class AlphaFilter extends Filter {
+  constructor(alpha = 1) {
+    super();
+    this.alpha = alpha;
   }
 }
 
@@ -132,6 +139,8 @@ const runTicker = () => {
 globalThis.PIXI = {
   Container,
   Sprite,
+  Filter,
+  Matrix: class Matrix {},
   AlphaFilter,
   filters: { AlphaFilter },
   UPDATE_PRIORITY: { LOW: -25 }
@@ -197,7 +206,7 @@ globalThis.canvas = {
   app: { ticker, renderer: { screen: {} } },
   tiles: {
     placeables: [tile],
-    get: id => id === tile.id ? tile : null,
+    get: id => canvas.tiles.placeables.find(tile => tile.id === id) ?? null,
     preview: { children: [] }
   },
   weather: { destroyed: false, render: () => coreWeatherRenders++ }
@@ -305,8 +314,91 @@ assert.ok(
   "the ignored pass stays below Foundry's interface group"
 );
 
+// Regression: a normal tile must cover a lower unlit tile in both passes.
+const coverDocument = {
+  id: "cover", documentName: "Tile", elevation: 0, sort: 10, alpha: 1,
+  getFlag() { return 0; }
+};
+const coverMesh = new Sprite({ id: "cover-texture" });
+coverMesh.unoccludedAlpha = 1;
+const cover = { id: coverDocument.id, document: coverDocument, mesh: coverMesh, isVisible: true };
+canvas.tiles.placeables.push(cover);
+runTicker();
+assert.equal(unlitSprite.filters.length, 1, "a higher ordinary tile masks the unlit copy");
+const coverFilter = unlitSprite.filters[0];
+assert.equal(coverFilter.mesh, coverMesh, "the mask samples the live covering texture and transform");
+assert.equal(coverFilter.uniforms.maskAlpha, 1, "an opaque covering tile fully blocks the unlit copy");
+assert.equal(coverMesh.renderable, true, "using a tile as an inverse mask does not hide its lit mesh");
+assert.equal(coverMesh.filters, null, "the covering tile's rendering is untouched");
+assert.equal(overlay.children[0].filters[0], coverFilter, "weather replay is clipped by the same cover");
+
+coverMesh.alpha = 0.5;
+coverMesh.unoccludedAlpha = 0.4;
+runTicker();
+assert.equal(unlitSprite.filters[0], coverFilter, "mask filters are reused between frames");
+assert.equal(coverFilter.uniforms.maskAlpha, 0.2, "mask coverage follows live fade and tile opacity");
+
+cover.isVisible = false;
+runTicker();
+assert.equal(unlitSprite.filters, null, "invisible tiles do not cover the unlit copy");
+assert.equal(coverFilter.destroyed, true, "unused mask filters are destroyed");
+cover.isVisible = true;
+coverDocument.sort = -10;
+runTicker();
+assert.equal(unlitSprite.filters, null, "ordinary tiles below the unlit tile do not mask it");
+coverDocument.elevation = 1;
+document.sort = 2_000_000;
+runTicker();
+assert.equal(unlitSprite.filters.length, 1, "elevation takes precedence even over very large sort values");
+
+coverMesh.getBounds = () => ({ x: 200, y: 200, width: 100, height: 100 });
+mesh.getBounds = () => ({ x: 0, y: 0, width: 100, height: 100 });
+runTicker();
+assert.equal(unlitSprite.filters, null, "non-overlapping tiles do not allocate masking passes");
+coverMesh.getBounds = () => ({ x: 0, y: 0, width: 100, height: 100 });
+runTicker();
+assert.equal(unlitSprite.filters.length, 1, "moving a covering tile into the unlit tile updates its mask");
+
+const previewMesh = new Sprite({ id: "cover-preview-texture" });
+previewMesh.unoccludedAlpha = 0.3;
+const coverPreview = { ...cover, mesh: previewMesh, isPreview: true, _original: cover };
+canvas.tiles.preview.children.push(coverPreview);
+runTicker();
+assert.equal(unlitSprite.filters[0].mesh, previewMesh, "cover masks follow live TileConfig previews");
+assert.equal(unlitSprite.filters[0].uniforms.maskAlpha, 0.3, "preview opacity is reflected in coverage");
+canvas.tiles.preview.children.length = 0;
+runTicker();
+assert.equal(unlitSprite.filters[0].mesh, coverMesh, "closing a cover preview restores the persistent mesh");
+
+// Foundry's live mesh ordering can differ from the document during previews.
+let nativeComparisons = 0;
+canvas.primary = { constructor: { _compareObjects(a, b) {
+  nativeComparisons++;
+  return a === coverMesh ? -1 : 1;
+} } };
+runTicker();
+assert.ok(nativeComparisons > 0, "Foundry's native mesh comparator is used when available");
+assert.equal(unlitSprite.filters, null, "live mesh ordering takes precedence over document ordering");
+delete canvas.primary;
+
+flags["fvtt-tile-unlit"].ignoreWeather = false;
+callHook("updateTile", document);
+runTicker();
+assert.equal(unlitSprite.parent, affected, "the regression also covers the weather-affected pass");
+assert.equal(unlitSprite.filters.length, 1, "tile occlusion survives switching weather mode");
+const teardownFilter = unlitSprite.filters[0];
+
+canvas.tiles.placeables.pop();
+runTicker();
+assert.equal(unlitSprite.filters, null, "removing the ordinary tile removes its occlusion");
+assert.equal(teardownFilter.destroyed, true, "removing the ordinary tile releases its mask filter");
+canvas.tiles.placeables.push(cover);
+runTicker();
+const finalFilter = unlitSprite.filters[0];
+
 callHook("canvasTearDown");
 assert.equal(mesh.renderable, true, "teardown restores the source mesh");
 assert.equal(mesh.filters, null, "teardown removes only Tile Unlit's suppression filter");
+assert.equal(finalFilter.destroyed, true, "teardown destroys tile occlusion filters");
 
 console.log("Tile Unlit compatibility smoke test passed.");

@@ -12,6 +12,60 @@ let tileConfigTemplatePromise = null;
 // follows the preview instead of letting Foundry draw a normally-lit clone.
 const configPreviewState = new Map();
 
+/** Remove the pixels covered by a normally-lit tile above the unlit copy. */
+class TileUnlitOcclusionFilter extends PIXI.Filter {
+  constructor(mesh) {
+    super(`
+      attribute vec2 aVertexPosition;
+      attribute vec2 aTextureCoord;
+      uniform mat3 projectionMatrix;
+      uniform mat3 otherMatrix;
+      varying vec2 vTextureCoord;
+      varying vec2 vMaskCoord;
+      void main(void) {
+        gl_Position = vec4((projectionMatrix * vec3(aVertexPosition, 1.0)).xy, 0.0, 1.0);
+        vTextureCoord = aTextureCoord;
+        vMaskCoord = (otherMatrix * vec3(aTextureCoord, 1.0)).xy;
+      }
+    `, `
+      varying vec2 vTextureCoord;
+      varying vec2 vMaskCoord;
+      uniform sampler2D uSampler;
+      uniform sampler2D mask;
+      uniform vec4 maskClamp;
+      uniform float maskAlpha;
+      void main(void) {
+        float inside = step(maskClamp.x, vMaskCoord.x) * step(maskClamp.y, vMaskCoord.y)
+          * step(vMaskCoord.x, maskClamp.z) * step(vMaskCoord.y, maskClamp.w);
+        float coverage = texture2D(mask, vMaskCoord).a * maskAlpha * inside;
+        gl_FragColor = texture2D(uSampler, vTextureCoord) * (1.0 - coverage);
+      }
+    `, { mask: mesh.texture, otherMatrix: new PIXI.Matrix(), maskClamp: new Float32Array(4), maskAlpha: 1 });
+    this.mesh = mesh;
+    this.maskMatrix = new PIXI.Matrix();
+  }
+
+  apply(filterManager, input, output, clearMode) {
+    const mesh = this.mesh;
+    const texture = mesh?.texture;
+    if (!mesh || mesh.destroyed || !texture?.valid) {
+      this.uniforms.maskAlpha = 0;
+      this.uniforms.mask = PIXI.Texture.EMPTY;
+    } else {
+      // Use the live source transform and UVs, including rotation, mirroring,
+      // config previews, and animated/video textures. Unlike SpriteMaskFilter,
+      // this must never set the original mesh's renderable property to false.
+      texture.uvMatrix ??= new PIXI.TextureMatrix(texture, 0);
+      texture.uvMatrix.update();
+      this.uniforms.mask = texture;
+      this.uniforms.otherMatrix = filterManager.calculateSpriteMatrix(this.maskMatrix, mesh)
+        .prepend(texture.uvMatrix.mapCoord);
+      this.uniforms.maskClamp = texture.uvMatrix.uClampFrame;
+    }
+    filterManager.applyFilter(this, input, output, clearMode);
+  }
+}
+
 /**
  * Tile Unlit for Foundry VTT v14.
  *
@@ -36,7 +90,7 @@ class TileUnlitPass {
     this.weatherIgnored = null;
     /** @type {PIXI.Container|null} */
     this.weatherMask = null;
-    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, weatherOverlay: PIXI.Container, weatherMask: PIXI.Sprite, ignoreWeather: boolean, suppressedMesh?: any, suppressionFilter?: PIXI.Filter|null}>} */
+    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, weatherOverlay: PIXI.Container, weatherMask: PIXI.Sprite, ignoreWeather: boolean, occlusionFilters: Map<string, TileUnlitOcclusionFilter>, suppressedMesh?: any, suppressionFilter?: PIXI.Filter|null}>} */
     this.entries = new Map();
     this._tickerBound = this._tick.bind(this);
     this._orderingTickerBound = this._ensureRootOrdering.bind(this);
@@ -416,6 +470,7 @@ class TileUnlitPass {
         weatherOverlay,
         weatherMask,
         ignoreWeather,
+        occlusionFilters: new Map(),
         suppressedMesh: null,
         suppressionFilter: null
       };
@@ -423,6 +478,70 @@ class TileUnlitPass {
     }
 
     this._syncEntry(entry, visualTile, strength, ignoreWeather);
+  }
+
+  /** Keep post-lighting copies behind the ordinary tiles in Foundry's order. */
+  _syncTileOcclusion() {
+    if (!this.entries.size) return;
+
+    const compare = canvas?.primary?.constructor?._compareObjects;
+    const rows = (canvas?.tiles?.placeables ?? []).map((tile, index) => {
+      const visual = this._getVisualTile(tile);
+      return { tile, visual, mesh: visual?.mesh, index };
+    }).filter(row => row.mesh && !row.mesh.destroyed);
+    rows.sort((a, b) => {
+      if (compare) return compare(a.mesh, b.mesh) || a.index - b.index;
+      // The same tuple as PrimaryCanvasGroup; do not pack elevation and sort
+      // into one zIndex, since sort values can exceed any chosen multiplier.
+      return ((a.mesh.elevation ?? a.visual.document.elevation ?? 0)
+        - (b.mesh.elevation ?? b.visual.document.elevation ?? 0))
+        || ((a.mesh.sortLayer ?? 0) - (b.mesh.sortLayer ?? 0))
+        || ((a.mesh.sort ?? a.visual.document.sort ?? 0) - (b.mesh.sort ?? b.visual.document.sort ?? 0))
+        || ((a.mesh.zIndex ?? 0) - (b.mesh.zIndex ?? 0))
+        || ((a.mesh._lastSortedIndex ?? a.index) - (b.mesh._lastSortedIndex ?? b.index));
+    });
+
+    for (const row of rows) {
+      row.bounds = row.mesh.getBounds?.();
+      row.alpha = this._clampStrength(row.mesh.alpha
+        * this._clampStrength(row.mesh.unoccludedAlpha ?? row.visual.document.alpha ?? 1));
+      row.blocks = row.visual.isVisible && row.mesh.visible && row.mesh.renderable
+        && row.alpha > 0 && this._getEffectiveStrength(row.tile) <= 0;
+    }
+
+    for (let index = 0; index < rows.length; index++) {
+      const row = rows[index];
+      const entry = this.entries.get(row.tile.id);
+      if (!entry) continue;
+      entry.sprite.zIndex = entry.weatherMask.zIndex = index;
+      const blockers = new Set();
+      for (const above of rows.slice(index + 1)) {
+        if (!above.blocks) continue;
+        const a = row.bounds;
+        const b = above.bounds;
+        if (a && b && (a.x + a.width <= b.x || b.x + b.width <= a.x
+          || a.y + a.height <= b.y || b.y + b.height <= a.y)) continue;
+        blockers.add(above.tile.id);
+        let filter = entry.occlusionFilters.get(above.tile.id);
+        if (!filter) {
+          filter = new TileUnlitOcclusionFilter(above.mesh);
+          entry.occlusionFilters.set(above.tile.id, filter);
+        }
+        filter.mesh = above.mesh;
+        filter.uniforms.maskAlpha = above.alpha;
+      }
+      for (const [id, filter] of entry.occlusionFilters) {
+        if (blockers.has(id)) continue;
+        entry.occlusionFilters.delete(id);
+        filter.destroy();
+      }
+      const filters = [...entry.occlusionFilters.values()];
+      entry.sprite.filters = filters.length ? filters : null;
+      // Sprite masks sample only the source texture, so filtering weatherMask
+      // would have no effect. Clip the replay container itself instead.
+      entry.weatherOverlay.filters = filters.length ? filters : null;
+      entry.weatherOverlay.filterArea = filters.length ? row.bounds ?? canvas.app.renderer.screen : null;
+    }
   }
 
   _syncEntry(entry, visualTile, strength, ignoreWeather) {
@@ -588,10 +707,7 @@ class TileUnlitPass {
     // of hidden objects); do not independently reinterpret the hidden flag here.
     sprite.visible = Boolean(tile.isVisible && mesh.visible);
 
-    // Preserve deterministic order between multiple opted-in tiles.
-    const elevation = Number(tile.document.elevation ?? 0);
-    const sort = Number(tile.document.sort ?? 0);
-    sprite.zIndex = (elevation * 1_000_000) + sort;
+    // zIndex is assigned from Foundry's complete ordering in _syncTileOcclusion.
   }
 
   _getStrength(document) {
@@ -688,6 +804,10 @@ class TileUnlitPass {
       }
       entry.suppressionFilter = null;
 
+      entry.sprite.filters = entry.weatherOverlay.filters = null;
+      for (const filter of entry.occlusionFilters.values()) filter.destroy();
+      entry.occlusionFilters.clear();
+
       entry.weatherOverlay.mask = null;
       for (const object of [entry.sprite, entry.weatherOverlay, entry.weatherMask]) {
         try {
@@ -732,6 +852,7 @@ class TileUnlitPass {
       if (!visualTile?.mesh || visualTile.mesh.destroyed) continue;
       this._syncEntry(entry, visualTile, strength, this._getEffectiveIgnoreWeather(tile));
     }
+    this._syncTileOcclusion();
   }
 
   destroy() {
