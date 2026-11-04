@@ -119,6 +119,11 @@ class TileUnlitPass {
     this._fxMasterFilters = [];
     this._replayFXMasterParticles = false;
     this._renderingFXMasterParticles = false;
+    this._sourceRenderer = null;
+    this._sourceRender = null;
+    this._sourceRenderWrapper = null;
+    this._sourceRenderHadOwn = false;
+    this._sourceSuppressions = new WeakMap();
   }
 
   get active() {
@@ -642,6 +647,41 @@ class TileUnlitPass {
     else this._releaseMeshSuppression(entry, mesh);
   }
 
+  _trackSourceRenders() {
+    const renderer = canvas?.app?.renderer;
+    if (!renderer?.render || this._sourceRenderer === renderer) return;
+    this._releaseSourceRenderer();
+    const pass = this;
+    const render = renderer.render;
+    this._sourceRenderer = renderer;
+    this._sourceRender = render;
+    this._sourceRenderHadOwn = Object.hasOwn(renderer, "render");
+    this._sourceRenderWrapper = function(source, ...args) {
+      const suppression = pass._sourceSuppressions.get(source);
+      const filters = source?.filters;
+      const isolatedMesh = args[0]?.renderTexture && suppression && filters?.includes(suppression);
+      // FXMaster renders the live mesh by itself to build physical tile masks.
+      // Only scene/base captures should see the transparent original. Removing
+      // our filter for the isolated draw also preserves native ERASE blending.
+      if (isolatedMesh) source.filters = filters.filter(filter => filter !== suppression);
+      try {
+        return render.call(this, source, ...args);
+      } finally {
+        if (isolatedMesh) source.filters = filters;
+      }
+    };
+    renderer.render = this._sourceRenderWrapper;
+  }
+
+  _releaseSourceRenderer() {
+    if (this._sourceRenderer?.render === this._sourceRenderWrapper) {
+      if (this._sourceRenderHadOwn) this._sourceRenderer.render = this._sourceRender;
+      else delete this._sourceRenderer.render;
+    }
+    this._sourceRenderer = this._sourceRender = this._sourceRenderWrapper = null;
+    this._sourceSuppressions = new WeakMap();
+  }
+
   _createSuppressionFilter() {
     const AlphaFilter = PIXI.AlphaFilter ?? PIXI.filters?.AlphaFilter;
 
@@ -668,6 +708,7 @@ class TileUnlitPass {
   _suppressMesh(entry, mesh) {
     if (!mesh || mesh.destroyed) return;
 
+    this._trackSourceRenders();
     entry.suppressionFilter ??= this._createSuppressionFilter();
     const filter = entry.suppressionFilter;
     if (!filter || filter.destroyed) {
@@ -680,10 +721,12 @@ class TileUnlitPass {
     if (!filters.includes(filter)) mesh.filters = [...filters, filter];
     mesh.renderable = true;
     entry.suppressedMesh = mesh;
+    this._sourceSuppressions.set(mesh, filter);
   }
 
   _releaseMeshSuppression(entry, mesh = entry.suppressedMesh) {
     if (!mesh) return;
+    this._sourceSuppressions.delete(mesh);
 
     const filter = entry.suppressionFilter;
     if (!mesh.destroyed) {
@@ -965,6 +1008,7 @@ class TileUnlitPass {
       this.removeTile(id, entry.tile);
     }
     this.entries.clear();
+    this._releaseSourceRenderer();
 
     if (this.root && !this.root.destroyed) {
       try {

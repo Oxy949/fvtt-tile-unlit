@@ -102,6 +102,8 @@ playback, and Foundry's normal placeable-object behavior.
 At full strength the original mesh is made transparent without removing it
 from the render tree. This lets canvas modules continue to inspect it for
 weather masks and animate its live alpha while Tile Unlit draws the unlit copy.
+Isolated off-screen captures of that mesh retain its physical coverage and
+native blend mode, so FXMaster's tile masks remain valid at exactly `1`.
 
 The render pass is positioned relative to Foundry's effects and visibility
 groups at runtime instead of relying on fixed child indexes.
@@ -128,7 +130,9 @@ node tests/tile-unlit-webgl.mjs <path-to-pixi.js> <path-to-chrome> [path-to-foun
 Add `--fxmaster` to run the separate FXMaster compositor regression fixture.
 It exercises opaque and transparent output, particles with normal and SCREEN
 blending, filter effects, above-darkness bands, and both vision modes at
-multiple lighting and weather strengths.
+multiple lighting and weather strengths. It also checks physical tile-mask
+captures and the `0.99` to `1` transition with particle fog and core blizzard
+active together, including particles configured to render below tiles.
 
 The optional Foundry client directory enables tests with the installed Snow
 and Fog shaders, including their combined blizzard output. Tests read these

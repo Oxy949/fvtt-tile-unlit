@@ -2,6 +2,7 @@
 <meta charset="utf-8">
 <title>Tile Unlit FXMaster compositor regression tests</title>
 <script src="/pixi.js"></script>
+<script src="/snow-source.js"></script>
 <script type="module">
 const checks = [];
 const assert = (condition, message) => { if (!condition) throw new Error(message); checks.push(message); };
@@ -21,6 +22,17 @@ let aboveBand = null;
 window.game = { modules: new Map([["fxmaster", {active: true}], ["fxmaster-plus", {active: true}]]),
   settings: { get(module, key) { return key === "enable" || (key === "displayEffectsOverVision" && overVision); } } };
 const renderer = new PIXI.Renderer({width: 128, height: 128, backgroundColor: 0x303030, preserveDrawingBuffer: true});
+const originalRender = renderer.render;
+const compileShader = renderer.gl.compileShader;
+renderer.gl.compileShader = function(shader) {
+  compileShader.call(this,shader);
+  if (!this.getShaderParameter(shader,this.COMPILE_STATUS)) throw new Error(this.getShaderInfoLog(shader));
+};
+const linkProgram = renderer.gl.linkProgram;
+renderer.gl.linkProgram = function(program) {
+  linkProgram.call(this,program);
+  if (!this.getProgramParameter(program,this.LINK_STATUS)) throw new Error(this.getProgramInfoLog(program));
+};
 document.body.append(renderer.view);
 const stage = new PIXI.Container();
 const rendered = stage.addChild(new PIXI.Container());
@@ -94,6 +106,7 @@ window.CONFIG = {fxmaster: {getGlobalEffectsCompositor: () => compositor}};
 const filterEntries = new Map();
 window.FXMASTER = {filters: {stackEntries: filterEntries, getStackFilter: id => filterEntries.get(id)?.filter}};
 window.canvas = {ready:true, stage, rendered, environment:rendered, primary, effects, visibility, interface:interfaceGroup,
+  performance:{mode:2},
   app:{ticker,renderer}, tiles:{placeables:[tile], get(id) {return id === tile.id ? tile : null;}, preview:{children:[]}},
   particleeffects:{stackEntries: entries, _stackRoots:new Map([[particleRoot,roots]]), _applySceneMaskForEntry() {}}};
 const pixels = () => {const result = new Uint8Array(4); renderer.gl.readPixels(50,77,1,1,renderer.gl.RGBA,renderer.gl.UNSIGNED_BYTE,result); return Array.from(result).slice(0,3);};
@@ -197,10 +210,159 @@ try {
   assert(compositor._displayContainer.filters === null,
     "zero weather suppression releases the output filter");
   frame(0,0.5);
+  // FXMaster's below-tiles masks capture live meshes, including their filters.
+  // A transparent suppression filter used to erase physical coverage only at
+  // lighting=1, allowing dense fog particles to leak over the unlit surface.
+  frame(0,0);
+  const physicalMask = PIXI.RenderTexture.create({width:128,height:128});
+  const maskPixels = () => renderer.extract.pixels(physicalMask);
+  const alphaAt = (data,x,y) => data[(y*128+x)*4+3];
+  const captureTile = () => {
+    mesh.getBounds();
+    const filters = mesh.filters;
+    renderer.render(mesh,{renderTexture:physicalMask,clear:true,skipUpdateTransform:true});
+    assert(mesh.filters === filters,"isolated tile captures restore the original filter stack");
+    return maskPixels();
+  };
+  for (const lighting of [0.99,1]) {
+    frame(lighting,0);
+    const mask = captureTile();
+    assert(alphaAt(mask,50,50) === 255 && alphaAt(mask,5,5) === 0,
+      "physical tile coverage survives isolated captures at lighting " + lighting);
+  }
+  const sourceSuppression = mesh.filters;
+  const nativeAlphaFilter = new PIXI.AlphaFilter(0.5);
+  mesh.filters = [...sourceSuppression,nativeAlphaFilter];
+  assert(Math.abs(alphaAt(captureTile(),50,50)-128) <= 1,
+    "physical captures preserve third-party filters while bypassing source suppression");
+  mesh.filters = sourceSuppression;
+  nativeAlphaFilter.destroy();
+  const baseCapture = new PIXI.Container();
+  baseCapture._render = renderer => mesh.render(renderer);
+  renderer.render(baseCapture,{renderTexture:physicalMask,clear:true});
+  assert(alphaAt(maskPixels(),50,50) === 0,
+    "scene/base render lists still suppress the original fully unlit mesh");
+  baseCapture.destroy();
+  // Native ERASE submissions must erase instead of painting a filter quad.
+  const maskBackground = new PIXI.Sprite(PIXI.Texture.WHITE);
+  maskBackground.width = maskBackground.height = 128;
+  renderer.render(maskBackground,{renderTexture:physicalMask,clear:true});
+  mesh.blendMode = PIXI.BLEND_MODES.ERASE;
+  renderer.render(mesh,{renderTexture:physicalMask,clear:false,skipUpdateTransform:true});
+  const erased = maskPixels();
+  assert(alphaAt(erased,50,50) === 0 && alphaAt(erased,5,5) === 255,
+    "physical masks retain native ERASE blending at full lighting suppression");
+  mesh.blendMode = PIXI.BLEND_MODES.NORMAL;
+
+  const weather = primary.addChild(new PIXI.Container());
+  weather.weatherEffects = weather.addChild(new PIXI.Container());
+  const weatherVertex = `
+    attribute vec2 aVertexPosition;
+    uniform mat3 projectionMatrix;
+    uniform vec4 inputSize;
+    uniform vec4 outputFrame;
+    varying vec2 vTextureCoord;
+    varying vec2 vUvs;
+    varying vec2 vUvsOcclusion;
+    varying vec2 vUvsTerrain;
+    varying vec2 vStaticUvs;
+    void main(void) {
+      vec2 position = aVertexPosition * max(outputFrame.zw,vec2(0.0)) + outputFrame.xy;
+      gl_Position = vec4((projectionMatrix * vec3(position,1.0)).xy,0.0,1.0);
+      vTextureCoord = aVertexPosition * outputFrame.zw * inputSize.zw;
+      vUvs = vTextureCoord * 2.5;
+      vUvsOcclusion = vUvsTerrain = vStaticUvs = vTextureCoord;
+    }
+  `;
+  const weatherFragments = [window.foundrySnowShader,window.getFoundryFogShader?.()].filter(Boolean);
+  if (!weatherFragments.length) weatherFragments.push(`
+    varying vec2 vTextureCoord;
+    void main(void) { gl_FragColor = vec4(vec3(0.08 + step(0.95,fract(vTextureCoord.x*17.0))*0.4),1.0); }
+  `);
+  for (const fragment of weatherFragments) {
+    const effect = new PIXI.Sprite(PIXI.Texture.WHITE);
+    effect.width = effect.height = 128;
+    effect.blendMode = PIXI.BLEND_MODES.SCREEN;
+    const filter = new PIXI.Filter(weatherVertex,fragment,{
+      useOcclusion:false,useTerrain:false,tint:[0.95,1,1],time:0.73,alpha:1,direction:0.8,
+      intensity:0.15,slope:1,rotation:0
+    });
+    filter.blendMode = PIXI.BLEND_MODES.SCREEN;
+    effect.filters = [filter];
+    weather.weatherEffects.addChild(effect);
+  }
+  canvas.weather = weather;
+  const fogCanvas = document.createElement("canvas");
+  fogCanvas.width = fogCanvas.height = 64;
+  const fogContext = fogCanvas.getContext("2d");
+  const gradient = fogContext.createRadialGradient(32,32,0,32,32,32);
+  gradient.addColorStop(0,"rgba(221,221,221,0.65)");
+  gradient.addColorStop(1,"rgba(221,221,221,0)");
+  fogContext.fillStyle = gradient;
+  fogContext.fillRect(0,0,64,64);
+  const fogTexture = PIXI.Texture.from(fogCanvas);
+  const fogRoot = primary.addChild(new PIXI.Container());
+  const fogSlot = fogRoot.addChild(new PIXI.Container());
+  const fogSprite = fogSlot.addChild(new PIXI.Sprite(fogTexture));
+  fogSprite.position.set(10,10); fogSprite.width = fogSprite.height = 108;
+  fogSlot.visible = fogSlot.renderable = false;
+  fogSlot.__fxmCompositorSourceSuppressed = true;
+  const nativeFog = new PIXI.Container();
+  const nativeFogSprite = nativeFog.addChild(new PIXI.Sprite(fogTexture));
+  nativeFogSprite.position.copyFrom(fogSprite.position); nativeFogSprite.width = nativeFogSprite.height = 108;
+  const belowTilesMask = new PIXI.Filter(undefined,`
+    precision highp float;
+    varying vec2 vTextureCoord;
+    uniform sampler2D uSampler;
+    uniform sampler2D tileMask;
+    uniform vec4 inputSize;
+    uniform vec4 outputFrame;
+    void main(void) {
+      vec2 uv = (vTextureCoord * inputSize.xy + outputFrame.xy) / vec2(128.0);
+      gl_FragColor = texture2D(uSampler,vTextureCoord) * (1.0-texture2D(tileMask,uv).a);
+    }
+  `,{tileMask:physicalMask});
+  canvas.particleeffects.stackEntries = new Map([["fog",{root:fogRoot,slot:fogSlot,scope:"scene",belowTiles:true}]]);
+  canvas.particleeffects._stackRoots = new Map([[fogRoot,new Set([fogSlot])]]);
+  compositor._stackRowsFrame = [];
+  filterEntries.clear();
+  overVision = false;
+  hook("clientSettingChanged");
+  const combinedFrame = (lighting,weatherStrength) => {
+    strength = lighting; suppression = weatherStrength;
+    hook("refreshObject",tile);
+    for (const row of ticks.filter(row => row.priority >= 0)) row.callback.call(row.context);
+    captureTile();
+    renderer.render(nativeFog,{renderTexture:fxTexture,clear:true});
+    compositor.renderFrame();
+    for (const row of ticks.filter(row => row.priority < 0)) row.callback.call(row.context);
+    renderer.render(stage);
+    return renderer.extract.pixels();
+  };
+  for (const belowTiles of [false,true]) {
+    fogSlot.filters = nativeFog.filters = belowTiles ? [belowTilesMask] : null;
+    for (const weatherStrength of [0,0.5,1]) {
+      const almost = combinedFrame(0.99,weatherStrength);
+      const full = combinedFrame(1,weatherStrength);
+      let largestJump = 0;
+      for (let y=30;y<98;y++) for (let x=30;x<98;x++) for (let channel=0;channel<3;channel++) {
+        const index = (y*128+x)*4+channel;
+        largestJump = Math.max(largestJump,Math.abs(full[index]-almost[index]));
+      }
+      assert(largestJump <= 2,"blizzard and particle fog remain continuous at lighting=1, weather="
+        + weatherStrength + ", below tiles=" + belowTiles + ": max jump " + largestJump);
+    }
+  }
   hook("canvasTearDown");
   assert(compositor._displayContainer.filters === null, "teardown restores native output filters");
   assert(compositor._present === originalPresent, "teardown restores FXMaster's presentation method");
   assert(compositor.renderFrame === originalRenderFrame, "teardown restores FXMaster's native frame renderer");
+  assert(renderer.render === originalRender,"teardown restores the native renderer submission method");
+  physicalMask.destroy(true);
+  maskBackground.destroy();
+  belowTilesMask.destroy();
+  nativeFog.destroy({children:true});
+  fogTexture.destroy(true);
   window.result = {ok:true, pixi:PIXI.VERSION, checksPassed:checks.length, checks};
 } catch(error) {window.result = {ok:false,error:error.stack,checks};}
 </script>
