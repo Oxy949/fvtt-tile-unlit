@@ -1,6 +1,6 @@
 /** A screen-space mask which keeps the weather's original output blend mode. */
-class TileWeatherSelectionFilter extends PIXI.Filter {
-  constructor(texture, blendMode) {
+export class TileWeatherSelectionFilter extends PIXI.Filter {
+  constructor(texture, blendMode, weatherStrength = false) {
     super(undefined, `
       precision highp float;
       varying vec2 vTextureCoord;
@@ -10,13 +10,15 @@ class TileWeatherSelectionFilter extends PIXI.Filter {
       uniform vec4 outputFrame;
       uniform vec2 screenDimensions;
       uniform float replay;
+      uniform float weatherStrength;
       void main(void) {
         vec2 uv = (vTextureCoord * inputSize.xy + outputFrame.xy) / screenDimensions;
-        vec2 coverage = texture2D(selection, uv).rg;
-        float amount = mix(1.0 - coverage.r, coverage.g, replay);
+        vec3 coverage = texture2D(selection, uv).rgb;
+        float suppression = mix(coverage.r, coverage.b, weatherStrength);
+        float amount = mix(1.0 - suppression, coverage.g, replay);
         gl_FragColor = texture2D(uSampler, vTextureCoord) * amount;
       }
-    `, { selection: texture, screenDimensions: [1, 1], replay: 0 });
+    `, { selection: texture, screenDimensions: [1, 1], replay: 0, weatherStrength: Number(weatherStrength) });
     this.blendMode = blendMode;
   }
 }
@@ -26,8 +28,8 @@ class TileWeatherSelectionFilter extends PIXI.Filter {
  * flattening SCREEN-blended snow/fog into a normally-blended sprite mask.
  *
  * A single texture describes the visible tile surfaces: red removes original
- * weather, green restores it after lighting. Ordinary tiles paint black, so
- * higher tiles and transparent texture holes keep their proper coverage.
+ * weather, green restores it after lighting, and blue controls external FX
+ * suppression. Higher tiles and transparent holes retain proper coverage.
  */
 export class TileWeatherPass {
   constructor() {
@@ -38,16 +40,19 @@ export class TileWeatherPass {
     this.hasReplay = false;
     this._rendering = false;
     this._cameraState = null;
+    this.hasSelection = false;
   }
 
-  sync(rows, copyMeshState) {
+  sync(rows, copyMeshState, { externalWeather = false } = {}) {
     const weather = canvas?.weather;
     const renderer = canvas?.app?.renderer;
     const modified = rows.some(row => row.visible && row.alpha > 0 && (row.strength > 0 || row.ignoreWeather > 0));
     this.hasReplay = modified && rows.some(row => row.visible && row.alpha > 0
       && row.strength > 0 && row.ignoreWeather < 1);
-    if (!modified || !weather || weather.destroyed || !renderer?.render
-      || (weather.weatherEffects && !weather.weatherEffects.children.length)) {
+    const hasCoreWeather = weather && !weather.destroyed
+      && (!weather.weatherEffects || weather.weatherEffects.children.length > 0);
+    this.hasSelection = false;
+    if (!modified || !renderer?.render || (!hasCoreWeather && !externalWeather)) {
       this._releaseBindings();
       this.hasReplay = false;
       return;
@@ -75,12 +80,12 @@ export class TileWeatherPass {
         const filter = new PIXI.Filter(undefined, `
           varying vec2 vTextureCoord;
           uniform sampler2D uSampler;
-          uniform vec2 channels;
+          uniform vec3 channels;
           void main(void) {
             float alpha = texture2D(uSampler, vTextureCoord).a;
-            gl_FragColor = vec4(channels * alpha, 0.0, alpha);
+            gl_FragColor = vec4(channels * alpha, alpha);
           }
-        `, { channels: [0, 0] });
+        `, { channels: [0, 0, 0] });
         sprite.filters = [filter];
         this.maskRoot.addChild(sprite);
         mask = { sprite, filter };
@@ -89,7 +94,7 @@ export class TileWeatherPass {
       const mesh = row.mesh;
       const weatherStrength = Number(row.ignoreWeather);
       const channels = [row.strength > 0 ? 1 : weatherStrength,
-        row.strength > 0 ? 1 - weatherStrength : 0];
+        row.strength > 0 ? 1 - weatherStrength : 0, weatherStrength];
       const state = [mesh.texture, mesh.texture?._updateID, mesh.texture?.baseTexture?.dirtyId,
         row.alpha, mesh.alpha, mesh.unoccludedAlpha, index, ...channels, mesh.rotation,
         ...[mesh.position, mesh.scale, mesh.pivot, mesh.skew, mesh.anchor].flatMap(point => [point?.x, point?.y])];
@@ -102,6 +107,7 @@ export class TileWeatherPass {
       mask.sprite.zIndex = index;
       mask.filter.uniforms.channels[0] = channels[0];
       mask.filter.uniforms.channels[1] = channels[1];
+      mask.filter.uniforms.channels[2] = channels[2];
     }
     for (const [id, mask] of this.masks) {
       if (liveIds.has(id)) continue;
@@ -124,7 +130,12 @@ export class TileWeatherPass {
         transform: camera
       });
     }
-    this._syncBindings(weather, renderer);
+    this.hasSelection = true;
+    if (hasCoreWeather) this._syncBindings(weather, renderer);
+    else {
+      this._releaseBindings();
+      this.hasReplay = false;
+    }
   }
 
   _syncBindings(weather, renderer) {
@@ -211,5 +222,6 @@ export class TileWeatherPass {
     this.texture = null;
     this.hasReplay = false;
     this._cameraState = null;
+    this.hasSelection = false;
   }
 }

@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 
-const [pixiPath, chromePath, foundryClientPath] = process.argv.slice(2);
+const fxmaster = process.argv.includes("--fxmaster");
+const [pixiPath, chromePath, foundryClientPath] = process.argv.slice(2).filter(argument => argument !== "--fxmaster");
 if (!pixiPath || !chromePath) throw new Error("Pass paths to PIXI 7 and Chrome; optionally pass Foundry's client directory for the real SnowShader.");
 const modulePath = process.env.TILE_UNLIT_MODULE_PATH ?? fileURLToPath(new URL("../scripts/tile-unlit.js", import.meta.url));
 let snowSource = "window.foundrySnowShader = null;";
@@ -30,8 +31,9 @@ const server = createServer(async (request, response) => {
       "/pixi.js": pixiPath,
       "/module.js": modulePath,
       "/weather-pass.js": join(dirname(modulePath), "weather-pass.js"),
+      "/fxmaster-weather.js": join(dirname(modulePath), "fxmaster-weather.js"),
       "/template.hbs": join(dirname(modulePath), "..", "templates", "tile-unlit.hbs"),
-      "/": fileURLToPath(new URL("./tile-unlit-webgl.html", import.meta.url))
+      "/": fileURLToPath(new URL(fxmaster ? "./fxmaster-webgl.html" : "./tile-unlit-webgl.html", import.meta.url))
     };
     if (!(route in paths) && route !== "/snow-source.js") {
       response.writeHead(404).end();

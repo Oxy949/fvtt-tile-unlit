@@ -1,0 +1,206 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tile Unlit FXMaster compositor regression tests</title>
+<script src="/pixi.js"></script>
+<script type="module">
+const checks = [];
+const assert = (condition, message) => { if (!condition) throw new Error(message); checks.push(message); };
+const near = (actual, expected, tolerance = 3) => actual.every((value, index) => Math.abs(value - expected[index]) <= tolerance);
+const callbacks = new Map();
+window.Hooks = { on(name, callback) { const list = callbacks.get(name) ?? []; list.push(callback); callbacks.set(name, list); },
+  once(name, callback) { this.on(name, callback); } };
+const hook = (name, ...args) => { for (const callback of callbacks.get(name) ?? []) callback(...args); };
+const ticks = [];
+const ticker = { add(callback, context, priority = 0) { ticks.push({callback, context, priority}); },
+  remove(callback) { const index = ticks.findIndex(row => row.callback === callback); if (index >= 0) ticks.splice(index, 1); } };
+let overVision = false;
+let strength = 0;
+let suppression = 0;
+let sourceKind = "particles";
+let aboveBand = null;
+window.game = { modules: new Map([["fxmaster", {active: true}], ["fxmaster-plus", {active: true}]]),
+  settings: { get(module, key) { return key === "enable" || (key === "displayEffectsOverVision" && overVision); } } };
+const renderer = new PIXI.Renderer({width: 128, height: 128, backgroundColor: 0x303030, preserveDrawingBuffer: true});
+document.body.append(renderer.view);
+const stage = new PIXI.Container();
+const rendered = stage.addChild(new PIXI.Container());
+const primary = rendered.addChild(new PIXI.Container());
+const effects = rendered.addChild(new PIXI.Container());
+effects.addChild(new PIXI.Graphics().beginFill(0).drawRect(0, 0, 128, 128).endFill());
+effects.alpha = 0.25;
+const visibility = rendered.addChild(new PIXI.Container());
+const interfaceGroup = rendered.addChild(new PIXI.Container());
+const documentData = {id: "tile", documentName: "Tile", alpha: 1, elevation: 0, sort: 0,
+  getFlag(module, key) { return key === "ignoreLighting" ? strength : suppression; } };
+const mesh = new PIXI.Sprite(PIXI.Texture.WHITE);
+mesh.position.set(20, 20); mesh.width = mesh.height = 88; mesh.tint = 0x805020; mesh.unoccludedAlpha = 1;
+const tile = {id: "tile", document: documentData, mesh, isVisible: true, renderFlags: {set() {}}};
+primary.addChild(mesh);
+const fxTexture = PIXI.RenderTexture.create({width:128, height:128});
+const fxScene = new PIXI.Container();
+const background = fxScene.addChild(new PIXI.Graphics().beginFill(0x303030).drawRect(0,0,128,128).endFill());
+const sourceTile = fxScene.addChild(new PIXI.Sprite(PIXI.Texture.WHITE));
+sourceTile.position.copyFrom(mesh.position); sourceTile.width = sourceTile.height = 88; sourceTile.tint = mesh.tint;
+const fxFilter = new PIXI.Filter(undefined, `
+  varying vec2 vTextureCoord;
+  uniform sampler2D uSampler;
+  void main(void) {
+    vec4 color = texture2D(uSampler, vTextureCoord);
+    gl_FragColor = vec4(color.rgb * vec3(0.6, 0.8, 1.0) + color.a * vec3(0.0, 0.0, 0.25), color.a);
+  }
+`);
+const particleRoot = primary.addChild(new PIXI.Container());
+const entries = new Map();
+const roots = new Set();
+for (const [id, type, alpha] of [["base", "rain", 0.3], ["plus", "sandstorm", 0.2]]) {
+  const slot = particleRoot.addChild(new PIXI.Container());
+  const particle = slot.addChild(new PIXI.Sprite(PIXI.Texture.WHITE));
+  particle.position.set(40,40); particle.width = particle.height = 40; particle.tint = 0x20a0ff; particle.alpha = alpha;
+  // Registered scene sources are suppressed while FXMaster owns their output.
+  slot.visible = false; slot.renderable = false; slot.__fxmCompositorSourceSuppressed = true;
+  roots.add(slot);
+  entries.set(id, {root: particleRoot, slot, container: slot, scope: "scene", fx: {enabled:false, type}});
+  const reference = fxScene.addChild(new PIXI.Sprite(PIXI.Texture.WHITE));
+  reference.position.copyFrom(particle.position); reference.width = reference.height = 40;
+  reference.tint = particle.tint; reference.alpha = alpha; reference.name = "particle";
+}
+const compositor = {
+  _stackRowsFrame: [], _displayContainer: null, _displaySprite: null,
+  renderFrame() {
+    for (const target of [this._displayContainer, this._aboveDarknessDisplayContainer, canvas.particleeffects?._aboveContent]) {
+      for (const filter of target?.filters ?? []) {
+        if (filter.uniforms.weatherStrength === 1 && filter.enabled)
+          throw new Error("FX masks must be disabled during native off-screen captures");
+      }
+    }
+    this._present(fxTexture);
+  },
+  _present(texture) {
+    if (!this._displayContainer || this._displayContainer.destroyed) {
+      this._displayContainer = new PIXI.Container();
+      this._displayContainer.name = "fxmasterGlobalEffectsOutputContainer";
+      this._displaySprite = this._displayContainer.addChild(new PIXI.Sprite(texture));
+      this._displaySprite.name = "fxmasterGlobalEffectsOutput";
+    }
+    this._displaySprite.texture = texture;
+    const parent = overVision ? rendered : primary;
+    if (this._displayContainer.parent !== parent) parent.addChild(this._displayContainer);
+    this._displayContainer.visible = !aboveBand;
+  }
+};
+const originalPresent = compositor._present;
+const originalRenderFrame = compositor.renderFrame;
+window.CONFIG = {fxmaster: {getGlobalEffectsCompositor: () => compositor}};
+const filterEntries = new Map();
+window.FXMASTER = {filters: {stackEntries: filterEntries, getStackFilter: id => filterEntries.get(id)?.filter}};
+window.canvas = {ready:true, stage, rendered, environment:rendered, primary, effects, visibility, interface:interfaceGroup,
+  app:{ticker,renderer}, tiles:{placeables:[tile], get(id) {return id === tile.id ? tile : null;}, preview:{children:[]}},
+  particleeffects:{stackEntries: entries, _stackRoots:new Map([[particleRoot,roots]]), _applySceneMaskForEntry() {}}};
+const pixels = () => {const result = new Uint8Array(4); renderer.gl.readPixels(50,77,1,1,renderer.gl.RGBA,renderer.gl.UNSIGNED_BYTE,result); return Array.from(result).slice(0,3);};
+const frame = (lighting, weather) => {
+  strength = lighting; suppression = weather;
+  hook("refreshObject", tile);
+  const fullComposite = sourceKind !== "particles";
+  background.visible = sourceTile.visible = fullComposite;
+  let particleIndex = 0;
+  for (const child of fxScene.children) if (child.name === "particle") {
+    child.visible = sourceKind !== "filters";
+    const mode = sourceKind === "screenParticles" || (sourceKind === "mixedParticles" && particleIndex === 1)
+      ? PIXI.BLEND_MODES.SCREEN : PIXI.BLEND_MODES.NORMAL;
+    child.blendMode = mode;
+    [...entries.values()][particleIndex].slot.children[0].blendMode = mode;
+    particleIndex++;
+  }
+  fxScene.filters = sourceKind === "filters" ? [fxFilter] : null;
+  // Over-vision captures already-lit scene pixels, including the unlit pass.
+  if (fullComposite) {
+    const amount = overVision ? 0.75 + 0.25 * lighting : 1;
+    sourceTile.tint = ((Math.round(128*amount)<<16) | (Math.round(80*amount)<<8) | Math.round(32*amount));
+  }
+  renderer.render(fxScene, {renderTexture:fxTexture, clear:true});
+  for (const row of ticks.filter(row => row.priority >= 0)) row.callback.call(row.context);
+  compositor.renderFrame();
+  for (const row of ticks.filter(row => row.priority < 0)) row.callback.call(row.context);
+  renderer.render(stage);
+  return pixels();
+};
+try {
+  // Native reference: actual PIXI blending, without Tile Unlit in the scene.
+  effects.alpha = 0;
+  const unlitParticleReference = frame(1,0);
+  effects.alpha = 0.25;
+  await import("/module.js");
+  hook("canvasReady");
+  const nativeParticles = frame(1,0);
+  assert(near(nativeParticles, unlitParticleReference),
+    "unlit replay preserves particle alpha on colored tile textures: " + nativeParticles + " expected " + unlitParticleReference);
+  for (const kind of ["particles", "screenParticles", "mixedParticles", "filters"]) {
+    sourceKind = kind;
+    canvas.particleeffects.stackEntries = kind !== "filters" ? entries : new Map();
+    filterEntries.clear();
+    if (kind === "filters") filterEntries.set("filter", {filter:fxFilter});
+    compositor._stackRowsFrame = kind === "filters" ? [{kind:"filter",uid:"filter"}] : [];
+    for (const mode of [false,true]) {
+      overVision = mode;
+      hook("clientSettingChanged");
+      for (const lighting of [0,0.5,1]) {
+        const wet = frame(lighting,0);
+        const dry = frame(lighting,1);
+        assert(!near(wet,dry,5), kind + " respond to weather endpoints at lighting " + lighting + ", over vision " + mode);
+        for (const weather of [0.25,0.5,0.75]) {
+          const actual = frame(lighting,weather);
+          const expected = wet.map((value,index) => value*(1-weather)+dry[index]*weather);
+          // Different blend operators compose nonlinearly. They must still
+          // attenuate smoothly instead of staying unchanged until the endpoint.
+          const smoothMixed = kind === "mixedParticles" && !mode && actual.every((value,index) => {
+            const delta = Math.abs(wet[index]-dry[index]);
+            return value >= Math.min(wet[index],dry[index])-2 && value <= Math.max(wet[index],dry[index])+2
+              && (delta < 8 || Math.abs(value-wet[index]) > delta*0.1);
+          });
+          assert(smoothMixed || near(actual,expected), kind + " suppression " + weather + " at lighting " + lighting
+            + ", over vision " + mode + ": " + actual + " expected " + expected);
+        }
+      }
+    }
+  }
+  sourceKind = "particles";
+  overVision = false;
+  filterEntries.clear();
+  compositor._stackRowsFrame = [];
+  canvas.particleeffects.stackEntries = new Map();
+  hook("clientSettingChanged");
+  aboveBand = rendered.addChildAt(new PIXI.Container(), rendered.getChildIndex(effects) + 1);
+  const aboveSprite = aboveBand.addChild(new PIXI.Sprite(fxTexture));
+  aboveSprite.blendMode = PIXI.BLEND_MODES.ADD;
+  compositor._aboveDarknessDisplayContainer = aboveBand;
+  const bandWet = frame(0,0);
+  const bandDry = frame(0,1);
+  const bandHalf = frame(0,0.5);
+  assert(near(bandHalf, bandWet.map((value,index) => (value+bandDry[index])/2)),
+    "above-darkness compositor output preserves additive blending while fading");
+  compositor._aboveDarknessDisplayContainer = null;
+  canvas.particleeffects._aboveContent = aboveBand;
+  aboveSprite.blendMode = PIXI.BLEND_MODES.SCREEN;
+  const liveWet = frame(0,0);
+  const liveDry = frame(0,1);
+  const liveHalf = frame(0,0.5);
+  assert(near(liveHalf, liveWet.map((value,index) => (value+liveDry[index])/2)),
+    "live above-darkness particles preserve SCREEN blending while fading");
+  delete canvas.particleeffects._aboveContent;
+  aboveBand.destroy({children:true});
+  aboveBand = null;
+  // A late-created/replaced native output must receive the selection filter.
+  compositor._displayContainer.destroy({children:true});
+  frame(0,1);
+  assert(compositor._displayContainer.filters?.length === 1, "replacement FXMaster compositor outputs are masked immediately");
+  frame(0,0);
+  assert(compositor._displayContainer.filters === null,
+    "zero weather suppression releases the output filter");
+  frame(0,0.5);
+  hook("canvasTearDown");
+  assert(compositor._displayContainer.filters === null, "teardown restores native output filters");
+  assert(compositor._present === originalPresent, "teardown restores FXMaster's presentation method");
+  assert(compositor.renderFrame === originalRenderFrame, "teardown restores FXMaster's native frame renderer");
+  window.result = {ok:true, pixi:PIXI.VERSION, checksPassed:checks.length, checks};
+} catch(error) {window.result = {ok:false,error:error.stack,checks};}
+</script>

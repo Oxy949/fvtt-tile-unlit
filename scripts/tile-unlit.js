@@ -1,4 +1,5 @@
 import { TileWeatherPass } from "./weather-pass.js";
+import { FXMasterWeatherPass, fxOutputBlendMode } from "./fxmaster-weather.js";
 
 const MODULE_ID = "fvtt-tile-unlit";
 const FXMASTER_ID = "fxmaster";
@@ -16,7 +17,7 @@ const configPreviewState = new Map();
 
 /** Remove the pixels covered by a normally-lit tile above the unlit copy. */
 class TileUnlitOcclusionFilter extends PIXI.Filter {
-  constructor(mesh) {
+  constructor(mesh, { inverse = true } = {}) {
     super(`
       attribute vec2 aVertexPosition;
       attribute vec2 aTextureCoord;
@@ -36,13 +37,15 @@ class TileUnlitOcclusionFilter extends PIXI.Filter {
       uniform sampler2D mask;
       uniform vec4 maskClamp;
       uniform float maskAlpha;
+      uniform float inverse;
       void main(void) {
         float inside = step(maskClamp.x, vMaskCoord.x) * step(maskClamp.y, vMaskCoord.y)
           * step(vMaskCoord.x, maskClamp.z) * step(vMaskCoord.y, maskClamp.w);
         float coverage = texture2D(mask, vMaskCoord).a * maskAlpha * inside;
-        gl_FragColor = texture2D(uSampler, vTextureCoord) * (1.0 - coverage);
+        gl_FragColor = texture2D(uSampler, vTextureCoord) * mix(coverage, 1.0 - coverage, inverse);
       }
-    `, { mask: mesh.texture, otherMatrix: new PIXI.Matrix(), maskClamp: new Float32Array(4), maskAlpha: 1 });
+    `, { mask: mesh.texture, otherMatrix: new PIXI.Matrix(), maskClamp: new Float32Array(4), maskAlpha: 1,
+      inverse: Number(inverse) });
     this.mesh = mesh;
     this.maskMatrix = new PIXI.Matrix();
   }
@@ -65,6 +68,17 @@ class TileUnlitOcclusionFilter extends PIXI.Filter {
       this.uniforms.maskClamp = texture.uvMatrix.uClampFrame;
     }
     filterManager.applyFilter(this, input, output, clearMode);
+  }
+}
+
+/** PIXI's default sprite mask also samples red; particle masks need alpha only. */
+class TileUnlitAlphaMaskFilter extends TileUnlitOcclusionFilter {
+  constructor(mesh) { super(mesh, { inverse: false }); }
+  get maskSprite() { return this.mesh; }
+  set maskSprite(mesh) { this.mesh = mesh; }
+  apply(filterManager, input, output, clearMode) {
+    this.uniforms.maskAlpha = this.mesh?.worldAlpha ?? this.mesh?.alpha ?? 0;
+    super.apply(filterManager, input, output, clearMode);
   }
 }
 
@@ -93,8 +107,9 @@ class TileUnlitPass {
     /** @type {PIXI.Container|null} */
     this.weatherMask = null;
     this.coreWeather = new TileWeatherPass();
+    this.fxWeather = new FXMasterWeatherPass();
     this.coreWeatherRoot = null;
-    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, weatherOverlay: PIXI.Container, weatherMask: PIXI.Sprite, ignoreWeather: number, occlusionFilters: Map<string, TileUnlitOcclusionFilter>, suppressedMesh?: any, suppressionFilter?: PIXI.Filter|null}>} */
+    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, weatherOverlay: PIXI.Container, weatherMask: PIXI.Sprite, weatherMaskFilter: TileUnlitAlphaMaskFilter, ignoreWeather: number, occlusionFilters: Map<string, TileUnlitOcclusionFilter>, suppressedMesh?: any, suppressionFilter?: PIXI.Filter|null}>} */
     this.entries = new Map();
     this._tickerBound = this._tick.bind(this);
     this._orderingTickerBound = this._ensureRootOrdering.bind(this);
@@ -269,7 +284,8 @@ class TileUnlitPass {
 
   _getFXMasterCompositor() {
     try {
-      return globalThis.CONFIG?.fxmaster?.getGlobalEffectsCompositor?.() ?? null;
+      return globalThis.CONFIG?.fxmaster?.getGlobalEffectsCompositor?.()
+        ?? globalThis.FXMASTER?.getGlobalEffectsCompositor?.() ?? null;
     } catch {
       return null;
     }
@@ -338,6 +354,7 @@ class TileUnlitPass {
 
     this._ensureAfterEffectsBeforeVisibility(this.root);
     this._ensureAfterEffectsBeforeVisibility(this.coreWeatherRoot, this.root);
+    this.fxWeather.syncOutputs();
 
     const fxOutput = this._getFXMasterOutputContainer();
     if (this._fxMasterOutputIsVisible() && fxOutput?.parent) {
@@ -407,6 +424,18 @@ class TileUnlitPass {
     }
   }
 
+  _getFXMasterParticleBlendMode() {
+    const ignored = new Set(this.fxWeather.bindings.values());
+    const modes = new Set();
+    for (const entry of canvas?.particleeffects?.stackEntries?.values?.() ?? []) {
+      if (!entry?.root || entry.root.destroyed || !entry?.slot || entry.slot.destroyed) continue;
+      const last = (entry.root.filters ?? [])
+        .filter(filter => filter && filter.enabled !== false && !ignored.has(filter)).at(-1);
+      modes.add(last?.blendMode ?? fxOutputBlendMode(entry.slot, ignored));
+    }
+    return modes.size === 1 ? modes.values().next().value : null;
+  }
+
   rebuild() {
     if (!this.root || !canvas?.tiles) return;
 
@@ -467,13 +496,14 @@ class TileUnlitPass {
       weatherOverlay.eventMode = "none";
       weatherOverlay.interactiveChildren = false;
       weatherOverlay.visible = false;
-      weatherOverlay.mask = weatherMask;
+      const weatherMaskFilter = new TileUnlitAlphaMaskFilter(weatherMask);
+      weatherMask.renderable = false;
 
       const weatherReplay = new PIXI.Container();
       weatherReplay.name = `${MODULE_ID}.${tile.id}.weatherReplay`;
       weatherReplay.eventMode = "none";
       weatherReplay.interactiveChildren = false;
-      weatherReplay._render = renderer => this._renderWeather(renderer);
+      weatherReplay._render = renderer => this._renderWeather(renderer, entry);
       weatherOverlay.addChild(weatherReplay);
       this.weatherOverlay.addChild(weatherOverlay);
 
@@ -482,6 +512,7 @@ class TileUnlitPass {
         sprite,
         weatherOverlay,
         weatherMask,
+        weatherMaskFilter,
         ignoreWeather,
         occlusionFilters: new Map(),
         suppressedMesh: null,
@@ -523,6 +554,7 @@ class TileUnlitPass {
       row.blocks = row.visible && row.mesh.renderable && row.alpha > 0 && row.strength <= 0;
     }
 
+    const particleBlendMode = this._getFXMasterParticleBlendMode();
     for (let index = 0; index < rows.length; index++) {
       const row = rows[index];
       const entry = this.entries.get(row.tile.id);
@@ -554,12 +586,23 @@ class TileUnlitPass {
       }
       const filters = [...entry.occlusionFilters.values()];
       entry.sprite.filters = filters.length ? filters : null;
-      // Sprite masks sample only the source texture, so filtering weatherMask
-      // would have no effect. Clip the replay container itself instead.
-      entry.weatherOverlay.filters = filters.length ? filters : null;
-      entry.weatherOverlay.filterArea = filters.length ? row.bounds ?? canvas.app.renderer.screen : null;
+      entry.groupedParticleMask = particleBlendMode !== null;
+      if (entry.groupedParticleMask) {
+        // Fade a common particle stack once, so overlapping sources do not
+        // compound the slider value. Preserve its native output blend mode.
+        entry.weatherMaskFilter.blendMode = particleBlendMode;
+        entry.weatherOverlay.filters = [...filters, entry.weatherMaskFilter];
+        entry.weatherOverlay.filterArea = row.bounds ?? canvas.app.renderer.screen;
+      } else {
+        entry.weatherOverlay.filters = null;
+        entry.weatherOverlay.filterArea = null;
+      }
     }
-    this.coreWeather.sync(rows, (tile, sprite) => this._copyMeshState(tile, sprite));
+    const fxEnabled = this._isFXMasterEnabled();
+    this.coreWeather.sync(rows, (tile, sprite) => this._copyMeshState(tile, sprite), { externalWeather: fxEnabled });
+    this.fxWeather.sync({ rows, texture: this.coreWeather.hasSelection ? this.coreWeather.texture : null,
+      root: this.root, rawRoot: this.weatherAffected, filters: this._fxMasterFilters,
+      compositor: this._getFXMasterCompositor(), enabled: fxEnabled, overVision: this._fxMasterDisplaysOverVision() });
   }
 
   _syncEntry(entry, visualTile, strength, ignoreWeather) {
@@ -575,7 +618,8 @@ class TileUnlitPass {
 
     if (!entry.weatherMask.destroyed) {
       if (entry.weatherMask.texture !== mesh.texture) entry.weatherMask.texture = mesh.texture;
-      this._copyMeshState(visualTile, entry.weatherMask, strength * (1 - ignoreWeather));
+      const blendFilteredPass = this._fxMasterFilters.length && !this._fxMasterDisplaysOverVision();
+      this._copyMeshState(visualTile, entry.weatherMask, strength * (blendFilteredPass ? 1 : 1 - ignoreWeather));
       entry.weatherMask.tint = 0xFFFFFF;
       entry.weatherMask.visible = ignoreWeather < 1 && entry.sprite.visible && (entry.weatherMask.alpha > 0);
     }
@@ -738,16 +782,16 @@ class TileUnlitPass {
     return typeof value === "boolean" ? 0 : this._clampStrength(value ?? 0);
   }
 
-  _renderWeather(renderer) {
+  _renderWeather(renderer, tileEntry) {
     if (!this.weatherOverlay?.visible) return;
 
-    if (this._replayFXMasterParticles) this._renderFXMasterParticles(renderer);
+    if (this._replayFXMasterParticles) this._renderFXMasterParticles(renderer, tileEntry);
   }
 
   /** Replay FXMaster's transparent particle slots inside the active tile mask. */
-  _renderFXMasterParticles(renderer) {
+  _renderFXMasterParticles(renderer, tileEntry) {
     const layer = canvas?.particleeffects;
-    if (this._renderingFXMasterParticles || !renderer || !layer?.stackEntries?.size) return;
+    if (this._renderingFXMasterParticles || !renderer || !layer?.stackEntries?.size || !tileEntry) return;
 
     const entries = [...layer.stackEntries.values()]
       .filter(entry => entry?.root && entry?.slot && !entry.root.destroyed && !entry.slot.destroyed)
@@ -763,14 +807,33 @@ class TileUnlitPass {
         const { root, slot } = entry;
         const runtime = entry.fx;
         const container = entry.container ?? slot;
-        if (runtime?.destroyed || (runtime && "enabled" in runtime && runtime.enabled === false)) continue;
-        if (container?.visible === false) continue;
+        const isRegion = entry.scope === "region" || Boolean(entry.regionId);
+
+        // Scene sources are deliberately left renderable=false by FXMaster
+        // while its global compositor owns them. Their runtime/container state
+        // therefore cannot be used as an enabled check here: membership in
+        // stackEntries is the source of truth. Region sources have additional
+        // live visibility gates, matching FXMaster's renderStackParticle path.
+        if (isRegion) {
+          const compositorSuppressed = Boolean(
+            container?.__fxmCompositorSourceSuppressed || slot?.__fxmCompositorSourceSuppressed
+          );
+          if (runtime?.destroyed || (runtime && "enabled" in runtime && runtime.enabled === false)) continue;
+          if (container?.visible === false) continue;
+          if (container?.renderable === false && !compositorSuppressed) continue;
+        }
 
         const candidates = layer._stackRoots?.get?.(root) ?? new Set([slot]);
         const previousCandidates = [];
         const previousRoot = { visible: root.visible, renderable: root.renderable };
 
         try {
+          // FXMaster prepares scene/region masks immediately before every
+          // compositor draw. Replaying the raw root without this step can use
+          // an empty or stale bucket mask and render no particles at all.
+          if (isRegion) layer._applyRegionMaskForEntry?.(entry);
+          else layer._applySceneMaskForEntry?.(root, entry);
+
           for (const candidate of candidates) {
             if (!candidate || candidate.destroyed) continue;
             previousCandidates.push([candidate, candidate.visible, candidate.renderable]);
@@ -781,7 +844,23 @@ class TileUnlitPass {
 
           root.visible = true;
           root.renderable = true;
-          root.render(renderer);
+          this.fxWeather.withoutSourceMasks(() => {
+            root.getBounds?.();
+            tileEntry.weatherMask.getBounds?.();
+            if (tileEntry.groupedParticleMask) {
+              root.render(renderer);
+              return;
+            }
+            const filters = root.filters;
+            const blendMode = fxOutputBlendMode(root) ?? PIXI.BLEND_MODES.NORMAL;
+            tileEntry.weatherMaskFilter.blendMode = blendMode;
+            try {
+              root.filters = [...(filters ?? []), ...tileEntry.occlusionFilters.values(), tileEntry.weatherMaskFilter];
+              root.render(renderer);
+            } finally {
+              root.filters = filters;
+            }
+          });
         } catch (error) {
           console.debug(`${MODULE_ID} | Failed to replay an FXMaster particle slot.`, error);
         } finally {
@@ -825,6 +904,7 @@ class TileUnlitPass {
       entry.occlusionFilters.clear();
 
       entry.weatherOverlay.mask = null;
+      entry.weatherMaskFilter?.destroy();
       for (const object of [entry.sprite, entry.weatherOverlay, entry.weatherMask]) {
         try {
           object.destroy({ children: true, texture: false, baseTexture: false });
@@ -873,6 +953,7 @@ class TileUnlitPass {
 
   destroy() {
     this._detachTicker();
+    this.fxWeather.destroy();
     this.coreWeather.destroy();
     if (this.coreWeatherRoot && !this.coreWeatherRoot.destroyed) {
       this.coreWeatherRoot.parent?.removeChild(this.coreWeatherRoot);

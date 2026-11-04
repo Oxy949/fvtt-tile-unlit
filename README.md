@@ -74,12 +74,16 @@ configuration replaces them with the numeric slider value.
 
 ## Module Compatibility
 
-- **[Gambit's FXMaster 8](https://github.com/gambit07/fxmaster):** for unlit tiles, when
-  **Ignore Weather** is `0`, active FXMaster particle and filter effects
-  are included in the weather-affected pass. At `1`, the tile is
-  kept above FXMaster output, including the optional **Display Effects over
-  Vision** mode. FXMaster's **Restricts Weather**, **Restricts Particles**, and
-  **Restricts Filters** tile masks keep using the original live tile mesh.
+- **[Gambit's FXMaster 8](https://github.com/gambit07/fxmaster) and FXMaster+:**
+  **Ignore Weather** controls their visual particle and filter output from `0`
+  to `1`, including tiles with **Ignore Lighting** set to `0`. The shared
+  FXMaster compositor is masked in both normal and **Display Effects over
+  Vision** modes, including its above-darkness output and live particle band.
+  FXMaster+ effects registered in that stack use the same integration.
+  Native region, foreground, and **Restricts Weather / Particles / Filters**
+  masks remain in place. Unlit particle replay preserves texture alpha and
+  native blend modes; partial suppression blends filtered unlit colors back
+  towards the original tile colors.
 - **[Darkness Activated Tiles](https://github.com/Oxy949/DarknessActivatedTiles):**
   visibility changes and configured fade transitions are mirrored from the
   live tile mesh, so a tile can be both darkness-activated and partially or
@@ -120,6 +124,11 @@ For pixel comparisons in a headless Chrome instance, run:
 ```text
 node tests/tile-unlit-webgl.mjs <path-to-pixi.js> <path-to-chrome> [path-to-foundry-client]
 ```
+
+Add `--fxmaster` to run the separate FXMaster compositor regression fixture.
+It exercises opaque and transparent output, particles with normal and SCREEN
+blending, filter effects, above-darkness bands, and both vision modes at
+multiple lighting and weather strengths.
 
 The optional Foundry client directory enables tests with the installed Snow
 and Fog shaders, including their combined blizzard output. Tests read these

@@ -144,6 +144,7 @@ globalThis.PIXI = {
   Sprite,
   Filter,
   Matrix: class Matrix {},
+  Texture: { EMPTY: {} },
   AlphaFilter,
   filters: { AlphaFilter },
   UPDATE_PRIORITY: { LOW: -25 },
@@ -270,14 +271,32 @@ globalThis.FXMASTER = {
 };
 
 let particleRenders = 0;
+let sceneParticleMaskPreparations = 0;
 const particleRoot = new Container();
 const particleSlot = new Container();
 particleSlot._render = () => particleRenders++;
 particleRoot.addChild(particleSlot);
-const particleEntry = { root: particleRoot, slot: particleSlot, fx: { enabled: true }, container: particleSlot };
+// FXMaster's compositor intentionally suppresses registered scene sources
+// between frames. Tile Unlit must treat stack membership as the scene-effect
+// enabled state, prepare FXMaster's live mask, and temporarily render the slot.
+particleSlot.visible = false;
+particleSlot.renderable = false;
+particleSlot.__fxmCompositorSourceSuppressed = true;
+const particleEntry = {
+  root: particleRoot,
+  slot: particleSlot,
+  scope: "scene",
+  fx: { enabled: false },
+  container: particleSlot
+};
 canvas.particleeffects = {
   stackEntries: new Map([["particle-1", particleEntry]]),
-  _stackRoots: new Map([[particleRoot, new Set([particleSlot])]])
+  _stackRoots: new Map([[particleRoot, new Set([particleSlot])]]),
+  _applySceneMaskForEntry(root, entry) {
+    assert.equal(root, particleRoot, "FXMaster scene-mask preparation receives the registered root");
+    assert.equal(entry, particleEntry, "FXMaster scene-mask preparation receives the registered entry");
+    sceneParticleMaskPreparations++;
+  }
 };
 const compositor = {
   _stackRowsFrame: [
@@ -305,6 +324,9 @@ assert.equal(coreWeatherRenders, 1, "core weather is replayed once through its i
 assert.equal(canvas.weather.weatherEffects.filters.at(-1).blendMode, PIXI.BLEND_MODES.SCREEN,
   "core snow keeps its SCREEN output blend mode");
 assert.equal(particleRenders, 1, "FXMaster particles are replayed through the tile mask");
+assert.equal(sceneParticleMaskPreparations, 1, "FXMaster prepares the live scene-particle mask before replay");
+assert.equal(particleSlot.visible, false, "FXMaster compositor source visibility is restored after replay");
+assert.equal(particleSlot.renderable, false, "FXMaster compositor suppression is restored after replay");
 
 flags["fvtt-tile-unlit"].ignoreWeather = 1;
 callHook("updateTile", document);
@@ -348,7 +370,7 @@ assert.equal(coverFilter.mesh, coverMesh, "the mask samples the live covering te
 assert.equal(coverFilter.uniforms.maskAlpha, 1, "an opaque covering tile fully blocks the unlit copy");
 assert.equal(coverMesh.renderable, true, "using a tile as an inverse mask does not hide its lit mesh");
 assert.equal(coverMesh.filters, null, "the covering tile's rendering is untouched");
-assert.equal(overlay.children[0].filters[0], coverFilter, "weather replay is clipped by the same cover");
+assert.equal(overlay.children[0].filters[0], coverFilter, "the common particle stack is clipped by the covering tile");
 
 coverMesh.alpha = 0.5;
 coverMesh.unoccludedAlpha = 0.4;
@@ -453,33 +475,33 @@ mesh.position.x += 1;
 weatherPass.sync([row], copyMaskState);
 assert.equal(selectionRenders, initialSelectionRenders + 1, "moving a tile rebuilds its weather selection mask");
 assert.equal(weatherPass.hasReplay, false, "ignoring weather at lighting strength zero does not replay weather");
-assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 0],
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 0, 1],
   "ignoring weather at lighting strength zero masks the original weather");
 row.strength = 1;
 row.ignoreWeather = 0;
 weatherPass.sync([row], copyMaskState);
 assert.equal(weatherPass.hasReplay, true, "fully unlit tiles can retain core weather");
-assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 1],
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 1, 0],
   "weather is removed from the lit base and restored over the unlit copy");
 row.ignoreWeather = 0.5;
 weatherPass.sync([row], copyMaskState);
 assert.equal(weatherPass.hasReplay, true, "partial weather suppression keeps replay active");
-assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 0.5],
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 0.5, 0.5],
   "unlit tiles replay the remaining weather intensity");
 row.strength = 0;
 weatherPass.sync([row], copyMaskState);
-assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [0.5, 0],
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [0.5, 0, 0.5],
   "normally lit tiles suppress weather proportionally");
 row.strength = 1;
 row.ignoreWeather = 1;
 weatherPass.sync([row], copyMaskState);
 assert.equal(weatherPass.hasReplay, false, "fully unlit tiles can independently exclude core weather");
-assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 0],
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 0, 1],
   "fully unlit weather-ignoring tiles suppress only the weather");
 row.strength = 0.5;
 row.ignoreWeather = 0;
 weatherPass.sync([row], copyMaskState);
-assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 1],
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 1, 0],
   "partial lighting strength does not fade weather coverage");
 const foreignWeatherFilter = new Filter();
 foreignWeatherFilter.blendMode = PIXI.BLEND_MODES.SCREEN;
@@ -496,5 +518,54 @@ assert.equal(previousTexture.destroyed, true, "resizing releases the old selecti
 assert.equal(weatherPass.texture.width, 256, "the weather selection texture follows canvas resize");
 weatherPass.destroy();
 assert.deepEqual(canvas.weather.filters, [foreignWeatherFilter], "weather teardown preserves third-party filters");
+
+// FXMaster-only scenes still need the shared selection texture, and native
+// compositor captures must never receive the presentation mask twice.
+canvas.weather = null;
+row.strength = 0;
+row.ignoreWeather = 0.5;
+const selectionPass = new TileWeatherPass();
+selectionPass.sync([row], copyMaskState, { externalWeather: true });
+assert.equal(selectionPass.hasSelection, true, "external weather builds its mask without core scene weather");
+assert.equal(selectionPass.hasReplay, false, "external weather does not enable core replay");
+assert.deepEqual(selectionPass.masks.get(tile.id).filter.uniforms.channels, [0.5, 0, 0.5],
+  "external FX suppression is independent of lighting strength");
+const { FXMasterWeatherPass } = await import("../scripts/fxmaster-weather.js");
+const adapter = new FXMasterWeatherPass();
+const nativeFilter = new Filter();
+const nativeCompositor = {
+  _displayContainer: null,
+  _present() {
+    if (!this._displayContainer) {
+      this._displayContainer = new Container();
+      this._displayContainer.filters = [nativeFilter];
+    }
+  },
+  renderFrame() {
+    for (const filter of this._displayContainer?.filters ?? []) {
+      if (filter.uniforms.weatherStrength === 1) assert.equal(filter.enabled, false, "FX captures bypass the presentation mask");
+    }
+    this._present();
+    return "native-frame";
+  }
+};
+const nativePresent = nativeCompositor._present;
+const nativeFrame = nativeCompositor.renderFrame;
+const options = { rows: [row], texture: selectionPass.texture, enabled: true, overVision: false,
+  filters: [], root: new Container(), rawRoot: new Container(), compositor: nativeCompositor };
+adapter.sync(options);
+assert.equal(nativeCompositor.renderFrame(), "native-frame", "the native frame result is preserved");
+assert.equal(nativeCompositor._displayContainer.filters[0], nativeFilter, "third-party output filters are preserved");
+const externalFilter = nativeCompositor._displayContainer.filters.at(-1);
+assert.equal(externalFilter.uniforms.weatherStrength, 1, "FXMaster output reads the external strength channel");
+assert.equal(nativeCompositor.renderFrame(), "native-frame", "subsequent captures keep the native frame result");
+assert.equal(externalFilter.enabled, true, "the presentation mask is restored after an off-screen capture");
+adapter.sync({ ...options, enabled: false });
+assert.deepEqual(nativeCompositor._displayContainer.filters, [nativeFilter], "disabling FX support restores native filters");
+assert.equal(externalFilter.destroyed, true, "unused FX selection filters are destroyed");
+assert.equal(nativeCompositor._present, nativePresent, "disabling FX support restores native presentation");
+assert.equal(nativeCompositor.renderFrame, nativeFrame, "disabling FX support restores native capture");
+adapter.destroy();
+selectionPass.destroy();
 
 console.log("Tile Unlit compatibility smoke test passed.");
