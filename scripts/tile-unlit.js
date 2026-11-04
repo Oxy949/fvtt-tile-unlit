@@ -1,3 +1,5 @@
+import { TileWeatherPass } from "./weather-pass.js";
+
 const MODULE_ID = "fvtt-tile-unlit";
 const FXMASTER_ID = "fxmaster";
 const DARKNESS_TILES_ID = "darkness-activated-tiles";
@@ -90,7 +92,9 @@ class TileUnlitPass {
     this.weatherIgnored = null;
     /** @type {PIXI.Container|null} */
     this.weatherMask = null;
-    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, weatherOverlay: PIXI.Container, weatherMask: PIXI.Sprite, ignoreWeather: boolean, occlusionFilters: Map<string, TileUnlitOcclusionFilter>, suppressedMesh?: any, suppressionFilter?: PIXI.Filter|null}>} */
+    this.coreWeather = new TileWeatherPass();
+    this.coreWeatherRoot = null;
+    /** @type {Map<string, {tile: any, sprite: PIXI.Sprite, weatherOverlay: PIXI.Container, weatherMask: PIXI.Sprite, ignoreWeather: number, occlusionFilters: Map<string, TileUnlitOcclusionFilter>, suppressedMesh?: any, suppressionFilter?: PIXI.Filter|null}>} */
     this.entries = new Map();
     this._tickerBound = this._tick.bind(this);
     this._orderingTickerBound = this._ensureRootOrdering.bind(this);
@@ -122,6 +126,12 @@ class TileUnlitPass {
     weatherIgnoredRoot.eventMode = "none";
     weatherIgnoredRoot.interactiveChildren = false;
     weatherIgnoredRoot.sortableChildren = true;
+
+    const coreWeatherRoot = new PIXI.Container();
+    coreWeatherRoot.name = `${MODULE_ID}.coreWeatherPass`;
+    coreWeatherRoot.eventMode = "none";
+    coreWeatherRoot.interactiveChildren = false;
+    coreWeatherRoot._render = renderer => this.coreWeather.render(renderer);
 
     const weatherAffected = new PIXI.Container();
     weatherAffected.name = `${MODULE_ID}.weatherAffected`;
@@ -161,6 +171,7 @@ class TileUnlitPass {
       console.error(`${MODULE_ID} | Unable to locate a canvas container for the unlit pass.`);
       root.destroy({ children: true });
       weatherIgnoredRoot.destroy({ children: true });
+      coreWeatherRoot.destroy({ children: true });
       return;
     }
 
@@ -170,9 +181,10 @@ class TileUnlitPass {
       const effectsIndex = effectsParent.getChildIndex(effects);
       const insertIndex = Math.min(effectsIndex + 1, effectsParent.children.length);
       effectsParent.addChildAt(root, insertIndex);
-      effectsParent.addChildAt(weatherIgnoredRoot, Math.min(insertIndex + 1, effectsParent.children.length));
+      effectsParent.addChildAt(coreWeatherRoot, Math.min(insertIndex + 1, effectsParent.children.length));
+      effectsParent.addChildAt(weatherIgnoredRoot, Math.min(insertIndex + 2, effectsParent.children.length));
     } else {
-      effectsParent.addChild(root, weatherIgnoredRoot);
+      effectsParent.addChild(root, coreWeatherRoot, weatherIgnoredRoot);
     }
 
     this.root = root;
@@ -181,6 +193,7 @@ class TileUnlitPass {
     this.weatherOverlay = weatherOverlay;
     this.weatherIgnored = weatherIgnored;
     this.weatherMask = weatherMask;
+    this.coreWeatherRoot = coreWeatherRoot;
     this.rebuild();
     this._attachTicker();
     this._ensureRootOrdering();
@@ -324,6 +337,7 @@ class TileUnlitPass {
     if (!this.root || this.root.destroyed || !this.weatherIgnoredRoot || this.weatherIgnoredRoot.destroyed) return;
 
     this._ensureAfterEffectsBeforeVisibility(this.root);
+    this._ensureAfterEffectsBeforeVisibility(this.coreWeatherRoot, this.root);
 
     const fxOutput = this._getFXMasterOutputContainer();
     if (this._fxMasterOutputIsVisible() && fxOutput?.parent) {
@@ -339,7 +353,7 @@ class TileUnlitPass {
       return;
     }
 
-    this._ensureAfterEffectsBeforeVisibility(this.weatherIgnoredRoot, this.root);
+    this._ensureAfterEffectsBeforeVisibility(this.weatherIgnoredRoot, this.coreWeatherRoot);
   }
 
   _getFXMasterFilters() {
@@ -446,9 +460,8 @@ class TileUnlitPass {
       weatherMask.interactiveChildren = false;
       this.weatherMask.addChild(weatherMask);
 
-      // A display object may be rendered more than once per frame. Replay the
-      // live Foundry weather layer through this tile's alpha-aware sprite mask
-      // so custom and animated weather effects remain supported.
+      // FXMaster particle replay retains its compatibility mask. Core weather
+      // uses one separate pass which preserves native effect blend modes.
       const weatherOverlay = new PIXI.Container();
       weatherOverlay.name = `${MODULE_ID}.${tile.id}.weatherOverlay`;
       weatherOverlay.eventMode = "none";
@@ -482,8 +495,6 @@ class TileUnlitPass {
 
   /** Keep post-lighting copies behind the ordinary tiles in Foundry's order. */
   _syncTileOcclusion() {
-    if (!this.entries.size) return;
-
     const compare = canvas?.primary?.constructor?._compareObjects;
     const rows = (canvas?.tiles?.placeables ?? []).map((tile, index) => {
       const visual = this._getVisualTile(tile);
@@ -505,8 +516,11 @@ class TileUnlitPass {
       row.bounds = row.mesh.getBounds?.();
       row.alpha = this._clampStrength(row.mesh.alpha
         * this._clampStrength(row.mesh.unoccludedAlpha ?? row.visual.document.alpha ?? 1));
-      row.blocks = row.visual.isVisible && row.mesh.visible && row.mesh.renderable
-        && row.alpha > 0 && this._getEffectiveStrength(row.tile) <= 0;
+      row.visible = Boolean(row.visual.isVisible && row.mesh.visible
+        && (row.mesh.renderable !== false || this.entries.get(row.tile.id)?.suppressedMesh === row.mesh));
+      row.strength = this._getEffectiveStrength(row.tile);
+      row.ignoreWeather = this._getEffectiveIgnoreWeather(row.tile);
+      row.blocks = row.visible && row.mesh.renderable && row.alpha > 0 && row.strength <= 0;
     }
 
     for (let index = 0; index < rows.length; index++) {
@@ -516,7 +530,10 @@ class TileUnlitPass {
       entry.sprite.zIndex = entry.weatherMask.zIndex = index;
       const blockers = new Set();
       for (const above of rows.slice(index + 1)) {
-        if (!above.blocks) continue;
+        const aboveEntry = this.entries.get(above.tile.id);
+        const crossesWeatherPass = above.visible && above.alpha > 0 && aboveEntry
+          && aboveEntry.sprite.parent !== entry.sprite.parent;
+        if (!above.blocks && !crossesWeatherPass) continue;
         const a = row.bounds;
         const b = above.bounds;
         if (a && b && (a.x + a.width <= b.x || b.x + b.width <= a.x
@@ -542,6 +559,7 @@ class TileUnlitPass {
       entry.weatherOverlay.filters = filters.length ? filters : null;
       entry.weatherOverlay.filterArea = filters.length ? row.bounds ?? canvas.app.renderer.screen : null;
     }
+    this.coreWeather.sync(rows, (tile, sprite) => this._copyMeshState(tile, sprite));
   }
 
   _syncEntry(entry, visualTile, strength, ignoreWeather) {
@@ -551,15 +569,15 @@ class TileUnlitPass {
     if (entry.sprite.texture !== mesh.texture) entry.sprite.texture = mesh.texture;
     this._copyMeshState(visualTile, entry.sprite, strength);
 
-    const spriteContainer = ignoreWeather ? this.weatherIgnored : this.weatherAffected;
+    const spriteContainer = ignoreWeather >= 1 ? this.weatherIgnored : this.weatherAffected;
     if (entry.sprite.parent !== spriteContainer) spriteContainer.addChild(entry.sprite);
     entry.ignoreWeather = ignoreWeather;
 
     if (!entry.weatherMask.destroyed) {
       if (entry.weatherMask.texture !== mesh.texture) entry.weatherMask.texture = mesh.texture;
-      this._copyMeshState(visualTile, entry.weatherMask, strength);
+      this._copyMeshState(visualTile, entry.weatherMask, strength * (1 - ignoreWeather));
       entry.weatherMask.tint = 0xFFFFFF;
-      entry.weatherMask.visible = !ignoreWeather && entry.sprite.visible && (entry.sprite.alpha > 0);
+      entry.weatherMask.visible = ignoreWeather < 1 && entry.sprite.visible && (entry.weatherMask.alpha > 0);
     }
     entry.weatherOverlay.visible = entry.weatherMask.visible;
     this._updateWeatherOverlayVisibility();
@@ -666,7 +684,7 @@ class TileUnlitPass {
 
   _getEffectiveIgnoreWeather(tile) {
     const state = configPreviewState.get(tile.id);
-    if (state && (typeof state.ignoreWeather === "boolean")) return state.ignoreWeather;
+    if (state && Number.isFinite(state.ignoreWeather)) return this._clampStrength(state.ignoreWeather);
     return this._getIgnoreWeather(tile.document);
   }
 
@@ -715,16 +733,14 @@ class TileUnlitPass {
   }
 
   _getIgnoreWeather(document) {
-    // Missing flags belong to tiles created before this option existed. Treat
-    // them as enabled so the module keeps its previous weather behaviour.
-    return document?.getFlag?.(MODULE_ID, WEATHER_FLAG_KEY) !== false;
+    const value = document?.getFlag?.(MODULE_ID, WEATHER_FLAG_KEY);
+    // Discard the old checkbox state. Only slider values carry weather strength.
+    return typeof value === "boolean" ? 0 : this._clampStrength(value ?? 0);
   }
 
   _renderWeather(renderer) {
     if (!this.weatherOverlay?.visible) return;
 
-    const weather = canvas?.weather;
-    if (weather && !weather.destroyed) weather.render(renderer);
     if (this._replayFXMasterParticles) this._renderFXMasterParticles(renderer);
   }
 
@@ -857,6 +873,12 @@ class TileUnlitPass {
 
   destroy() {
     this._detachTicker();
+    this.coreWeather.destroy();
+    if (this.coreWeatherRoot && !this.coreWeatherRoot.destroyed) {
+      this.coreWeatherRoot.parent?.removeChild(this.coreWeatherRoot);
+      this.coreWeatherRoot.destroy({ children: true });
+    }
+    this.coreWeatherRoot = null;
 
     for (const [id, entry] of [...this.entries]) {
       this.removeTile(id, entry.tile);
@@ -981,8 +1003,9 @@ Hooks.on("renderTileConfig", async (app, html) => {
 
   const rawValue = Number(document.getFlag(MODULE_ID, LIGHTING_FLAG_KEY) ?? 0);
   const numericValue = Number.isFinite(rawValue) ? Math.min(1, Math.max(0, rawValue)) : 0;
-  const value = numericValue.toFixed(1);
-  const ignoreWeather = document.getFlag(MODULE_ID, WEATHER_FLAG_KEY) !== false;
+  const value = numericValue.toFixed(2);
+  const ignoreWeather = unlitPass._getIgnoreWeather(document);
+  const weatherValue = ignoreWeather.toFixed(2);
 
   // Register the config session before doing any DOM work. TileConfig may have
   // already initialized its preview by the time this hook fires.
@@ -995,7 +1018,7 @@ Hooks.on("renderTileConfig", async (app, html) => {
   try {
     tileConfigTemplatePromise ??= foundry.applications.handlebars.getTemplate(TEMPLATE_PATH);
     const template = await tileConfigTemplatePromise;
-    const injectHtml = template({ value, ignoreWeather });
+    const injectHtml = template({ value, weatherValue });
 
     // The sheet may have been closed while the template was loading.
     if (!root.isConnected || root.querySelector(`[data-${MODULE_ID}]`)) return;
@@ -1023,7 +1046,7 @@ Hooks.on("renderTileConfig", async (app, html) => {
     else form.insertAdjacentHTML("beforeend", injectHtml);
 
     const fieldset = root.querySelector(`[data-${MODULE_ID}]`);
-    const lightingInput = fieldset?.querySelector('range-picker');
+    const lightingInput = fieldset?.querySelector(`[name="flags.${MODULE_ID}.${LIGHTING_FLAG_KEY}"]`);
     const weatherInput = fieldset?.querySelector(`[name="flags.${MODULE_ID}.${WEATHER_FLAG_KEY}"]`);
 
     lightingInput?.addEventListener("input", () => {
@@ -1037,8 +1060,9 @@ Hooks.on("renderTileConfig", async (app, html) => {
     });
 
     weatherInput?.addEventListener("input", () => {
+      const numeric = Number(weatherInput.value);
       const state = configPreviewState.get(document.id);
-      if (state) state.ignoreWeather = weatherInput.checked;
+      if (state && Number.isFinite(numeric)) state.ignoreWeather = Math.min(1, Math.max(0, numeric));
 
       const tile = canvas?.tiles?.get?.(document.id) ?? document.object;
       if (tile) unlitPass.syncTile(tile);

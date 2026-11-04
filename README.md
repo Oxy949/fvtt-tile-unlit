@@ -11,8 +11,8 @@ regardless of scene darkness, Ambient Lights, or Darkness sources.
 ## Features
 
 - Controls lighting independently for each tile.
-- Can keep individual unlit tiles above scene weather effects. This is enabled
-  by default to preserve the module's previous behavior.
+- Controls scene weather independently of lighting, including normally-lit tiles.
+- Preserves native snow, fog, and blizzard blending over unlit tiles.
 - Offers an adjustable effect strength from `0` to `1`:
   - `0` uses Foundry's standard lighting.
   - `1` makes the tile fully ignore scene lighting.
@@ -50,19 +50,33 @@ you explicitly change the setting.
    - Use `0` for normal scene lighting.
    - Use `1` for a completely unlit tile.
    - Use a value between `0` and `1` for a partial effect.
-4. Leave **Ignore Weather** enabled to display the unlit tile above weather,
-   or disable it to keep weather visible over the tile.
+4. Adjust **Ignore Weather** from `0` (normal scene weather) to `1` (no weather
+   over the tile). Intermediate values gradually reduce weather intensity;
+   for example, `0.5` ignores 50% of the weather. The default is `0`, and this
+   works at every **Ignore Lighting** value.
 5. Save the tile configuration.
 
 The values are stored on each Tile document as
 `flags.fvtt-tile-unlit.ignoreLighting` and
 `flags.fvtt-tile-unlit.ignoreWeather`.
 
+| Ignore Lighting | Ignore Weather | Appearance |
+| --- | --- | --- |
+| `0` | `0` | Normal scene lighting and weather |
+| `0` | `1` | Normal scene lighting, no weather over the tile |
+| `1` | `0` | Original tile brightness with weather |
+| `1` | `1` | Original tile brightness without weather |
+| Any | `0.5` | Half the normal weather intensity |
+
+Ignore Weather defaults to `0` for tiles without a saved value. Old checkbox
+values (`true` and `false`) are discarded and treated as `0`; saving the tile
+configuration replaces them with the numeric slider value.
+
 ## Module Compatibility
 
-- **[Gambit's FXMaster 8](https://github.com/gambit07/fxmaster):** when
-  **Ignore Weather** is disabled, active FXMaster particle and filter effects
-  are included in the weather-affected pass. When it is enabled, the tile is
+- **[Gambit's FXMaster 8](https://github.com/gambit07/fxmaster):** for unlit tiles, when
+  **Ignore Weather** is `0`, active FXMaster particle and filter effects
+  are included in the weather-affected pass. At `1`, the tile is
   kept above FXMaster output, including the optional **Display Effects over
   Vision** mode. FXMaster's **Restricts Weather**, **Restricts Particles**, and
   **Restricts Filters** tile masks keep using the original live tile mesh.
@@ -91,6 +105,25 @@ groups at runtime instead of relying on fixed child indexes.
 Normally-lit tiles above an unlit tile mask its post-lighting copy, following
 Foundry's elevation and sort order. The mask uses the covering tile's texture
 alpha and live opacity, so transparent areas remain see-through.
+
+Core weather uses one screen-sized selection mask for visible tile surfaces.
+The native layer retains its scene, roof, and terrain masks. Weather is excluded
+where required and restored over weather-affected unlit tiles in a separate
+pass, preserving the original effect blend modes instead of using per-tile
+sprite masks. Lighting strength does not scale the weather selection mask.
+
+## Development checks
+
+Run `node tests/tile-unlit-smoke.mjs` for lifecycle and compatibility checks.
+For pixel comparisons in a headless Chrome instance, run:
+
+```text
+node tests/tile-unlit-webgl.mjs <path-to-pixi.js> <path-to-chrome> [path-to-foundry-client]
+```
+
+The optional Foundry client directory enables tests with the installed Snow
+and Fog shaders, including their combined blizzard output. Tests read these
+sources locally and do not require a running world.
 
 
 If you encounter a problem, please

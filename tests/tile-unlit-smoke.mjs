@@ -27,6 +27,7 @@ class Container {
     this.alpha = 1;
     this.zIndex = 0;
     this.filters = null;
+    this.blendMode = 0;
   }
 
   addChild(...children) {
@@ -87,6 +88,8 @@ class Filter {
   constructor(vertex, fragment, uniforms = {}) {
     this.uniforms = uniforms;
     this.destroyed = false;
+    this.enabled = true;
+    this.blendMode = 0;
   }
 
   destroy() {
@@ -143,7 +146,11 @@ globalThis.PIXI = {
   Matrix: class Matrix {},
   AlphaFilter,
   filters: { AlphaFilter },
-  UPDATE_PRIORITY: { LOW: -25 }
+  UPDATE_PRIORITY: { LOW: -25 },
+  BLEND_MODES: { NORMAL: 0, SCREEN: 3 },
+  RenderTexture: { create({ width, height, resolution }) {
+    return { width, height, baseTexture: { resolution }, destroy() { this.destroyed = true; } };
+  } }
 };
 globalThis.requestAnimationFrame = callback => callback();
 globalThis.jQuery = class JQuery {};
@@ -155,7 +162,7 @@ const interfaceGroup = new Container();
 rendered.addChild(effects, visibility, interfaceGroup);
 
 const flags = {
-  "fvtt-tile-unlit": { ignoreLighting: 1, ignoreWeather: false },
+  "fvtt-tile-unlit": { ignoreLighting: 1, ignoreWeather: 0 },
   "darkness-activated-tiles": { darkness: { enabled: true } }
 };
 const document = {
@@ -203,14 +210,20 @@ globalThis.canvas = {
   rendered,
   environment: rendered,
   interface: interfaceGroup,
-  app: { ticker, renderer: { screen: {} } },
+  app: { ticker, renderer: { screen: { width: 128, height: 128 }, resolution: 1, render() {} } },
   tiles: {
     placeables: [tile],
     get: id => canvas.tiles.placeables.find(tile => tile.id === id) ?? null,
     preview: { children: [] }
   },
-  weather: { destroyed: false, render: () => coreWeatherRenders++ }
+  weather: new Container()
 };
+canvas.weather.weatherEffects = new Container();
+const snowEffect = new Sprite();
+snowEffect.blendMode = PIXI.BLEND_MODES.SCREEN;
+canvas.weather.weatherEffects.addChild(snowEffect);
+canvas.weather.addChild(canvas.weather.weatherEffects);
+canvas.weather.render = () => coreWeatherRenders++;
 globalThis.CONFIG = {};
 globalThis.FXMASTER = null;
 globalThis.foundry = { applications: { handlebars: {} } };
@@ -285,10 +298,15 @@ assert.deepEqual(
 const overlay = affectedRoot.children.find(child => child.name === "fvtt-tile-unlit.weatherOverlay");
 const weatherReplay = overlay.children[0].children[0];
 weatherReplay.render({});
-assert.equal(coreWeatherRenders, 1, "core weather is replayed through the tile mask");
+assert.equal(coreWeatherRenders, 0, "FXMaster's per-tile replay does not redraw core weather");
+const coreWeatherRoot = rendered.children.find(child => child.name === "fvtt-tile-unlit.coreWeatherPass");
+coreWeatherRoot.render({});
+assert.equal(coreWeatherRenders, 1, "core weather is replayed once through its independent pass");
+assert.equal(canvas.weather.weatherEffects.filters.at(-1).blendMode, PIXI.BLEND_MODES.SCREEN,
+  "core snow keeps its SCREEN output blend mode");
 assert.equal(particleRenders, 1, "FXMaster particles are replayed through the tile mask");
 
-flags["fvtt-tile-unlit"].ignoreWeather = true;
+flags["fvtt-tile-unlit"].ignoreWeather = 1;
 callHook("updateTile", document);
 runTicker();
 assert.equal(unlitSprite.parent, ignored, "Ignore Weather moves the sprite to the isolated pass");
@@ -381,11 +399,26 @@ assert.ok(nativeComparisons > 0, "Foundry's native mesh comparator is used when 
 assert.equal(unlitSprite.filters, null, "live mesh ordering takes precedence over document ordering");
 delete canvas.primary;
 
-flags["fvtt-tile-unlit"].ignoreWeather = false;
+flags["fvtt-tile-unlit"].ignoreWeather = 0;
 callHook("updateTile", document);
 runTicker();
 assert.equal(unlitSprite.parent, affected, "the regression also covers the weather-affected pass");
 assert.equal(unlitSprite.filters.length, 1, "tile occlusion survives switching weather mode");
+for (const previousValue of [true, false, undefined]) {
+  flags["fvtt-tile-unlit"].ignoreWeather = previousValue;
+  callHook("updateTile", document);
+  runTicker();
+  assert.equal(unlitSprite.parent, affected, "old boolean or missing weather values default to zero");
+}
+flags["fvtt-tile-unlit"].ignoreWeather = 0.5;
+callHook("updateTile", document);
+runTicker();
+assert.equal(unlitSprite.parent, affected, "partial weather suppression keeps the unlit copy below the weather pass");
+const fxMask = affectedRoot.children.find(child => child.name === "fvtt-tile-unlit.weatherMask").children[0];
+assert.equal(fxMask.alpha, unlitSprite.alpha * 0.5, "partial weather suppression scales FXMaster particle replay");
+flags["fvtt-tile-unlit"].ignoreWeather = 0;
+callHook("updateTile", document);
+runTicker();
 const teardownFilter = unlitSprite.filters[0];
 
 canvas.tiles.placeables.pop();
@@ -400,5 +433,68 @@ callHook("canvasTearDown");
 assert.equal(mesh.renderable, true, "teardown restores the source mesh");
 assert.equal(mesh.filters, null, "teardown removes only Tile Unlit's suppression filter");
 assert.equal(finalFilter.destroyed, true, "teardown destroys tile occlusion filters");
+assert.equal(canvas.weather.weatherEffects.filters, null, "teardown restores core weather filters");
+
+// Weather selection is independent of the unlit entry lifecycle.
+const { TileWeatherPass } = await import("../scripts/weather-pass.js");
+const weatherPass = new TileWeatherPass();
+let selectionRenders = 0;
+canvas.app.renderer.render = () => selectionRenders++;
+const row = { tile, visual: tile, mesh, visible: true, alpha: 1, strength: 0, ignoreWeather: 0 };
+const copyMaskState = (visual, sprite) => { sprite.alpha = visual.mesh.alpha; };
+weatherPass.sync([row], copyMaskState);
+assert.equal(canvas.weather.weatherEffects.filters, null, "normal lighting with weather enabled needs no compositor");
+row.ignoreWeather = 1;
+weatherPass.sync([row], copyMaskState);
+const initialSelectionRenders = selectionRenders;
+weatherPass.sync([row], copyMaskState);
+assert.equal(selectionRenders, initialSelectionRenders, "stationary tiles reuse the weather selection texture");
+mesh.position.x += 1;
+weatherPass.sync([row], copyMaskState);
+assert.equal(selectionRenders, initialSelectionRenders + 1, "moving a tile rebuilds its weather selection mask");
+assert.equal(weatherPass.hasReplay, false, "ignoring weather at lighting strength zero does not replay weather");
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 0],
+  "ignoring weather at lighting strength zero masks the original weather");
+row.strength = 1;
+row.ignoreWeather = 0;
+weatherPass.sync([row], copyMaskState);
+assert.equal(weatherPass.hasReplay, true, "fully unlit tiles can retain core weather");
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 1],
+  "weather is removed from the lit base and restored over the unlit copy");
+row.ignoreWeather = 0.5;
+weatherPass.sync([row], copyMaskState);
+assert.equal(weatherPass.hasReplay, true, "partial weather suppression keeps replay active");
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 0.5],
+  "unlit tiles replay the remaining weather intensity");
+row.strength = 0;
+weatherPass.sync([row], copyMaskState);
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [0.5, 0],
+  "normally lit tiles suppress weather proportionally");
+row.strength = 1;
+row.ignoreWeather = 1;
+weatherPass.sync([row], copyMaskState);
+assert.equal(weatherPass.hasReplay, false, "fully unlit tiles can independently exclude core weather");
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 0],
+  "fully unlit weather-ignoring tiles suppress only the weather");
+row.strength = 0.5;
+row.ignoreWeather = 0;
+weatherPass.sync([row], copyMaskState);
+assert.deepEqual(weatherPass.masks.get(tile.id).filter.uniforms.channels, [1, 1],
+  "partial lighting strength does not fade weather coverage");
+const foreignWeatherFilter = new Filter();
+foreignWeatherFilter.blendMode = PIXI.BLEND_MODES.SCREEN;
+canvas.weather.filters = [foreignWeatherFilter];
+weatherPass.sync([row], copyMaskState);
+assert.equal(canvas.weather.weatherEffects.filters, null, "native layer-wide filtering switches the mask to that layer");
+assert.equal(canvas.weather.filters[0], foreignWeatherFilter, "native layer-wide weather filters are preserved");
+assert.equal(canvas.weather.filters.at(-1).blendMode, foreignWeatherFilter.blendMode,
+  "layer-wide native filtering keeps its final output blend mode");
+const previousTexture = weatherPass.texture;
+canvas.app.renderer.screen.width = 256;
+weatherPass.sync([row], copyMaskState);
+assert.equal(previousTexture.destroyed, true, "resizing releases the old selection texture");
+assert.equal(weatherPass.texture.width, 256, "the weather selection texture follows canvas resize");
+weatherPass.destroy();
+assert.deepEqual(canvas.weather.filters, [foreignWeatherFilter], "weather teardown preserves third-party filters");
 
 console.log("Tile Unlit compatibility smoke test passed.");

@@ -1,0 +1,333 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tile Unlit WebGL regression tests</title>
+<script src="/pixi.js"></script>
+<script src="/snow-source.js"></script>
+<script type="module">
+const checks = [];
+const assert = (condition, message) => {
+  if (!condition) throw new Error(message);
+  checks.push(message);
+};
+const near = (a, b, tolerance = 2) => a.every((value, index) => Math.abs(value - b[index]) <= tolerance);
+const callbacks = new Map();
+window.Hooks = {
+  on(name, callback) {
+    const list = callbacks.get(name) ?? [];
+    list.push(callback);
+    callbacks.set(name, list);
+  },
+  once(name, callback) { this.on(name, callback); }
+};
+const hook = (name, ...args) => Promise.all((callbacks.get(name) ?? []).map(callback => callback(...args)));
+const ticks = [];
+const ticker = {
+  add(callback, context) { ticks.push([callback, context]); },
+  remove(callback) { const index = ticks.findIndex(row => row[0] === callback); if (index >= 0) ticks.splice(index, 1); }
+};
+window.game = { modules: new Map(), settings: { get() { return false; } } };
+window.CONFIG = {};
+const renderer = new PIXI.Renderer({ width: 160, height: 160, backgroundColor: 0x303030, preserveDrawingBuffer: true });
+document.body.append(renderer.view);
+const stage = new PIXI.Container();
+const rendered = stage.addChild(new PIXI.Container());
+const primary = rendered.addChild(new PIXI.Container());
+const effects = rendered.addChild(new PIXI.Container());
+effects.addChild(new PIXI.Graphics().beginFill(0).drawRect(0, 0, 160, 160).endFill());
+effects.alpha = 0.25;
+const visibility = rendered.addChild(new PIXI.Container());
+let strength = 0;
+let ignoreWeather = 0;
+const documentData = {
+  id: "tile", documentName: "Tile", alpha: 1, elevation: 0, sort: 0,
+  getFlag(module, key) { return key === "ignoreLighting" ? strength : ignoreWeather; }
+};
+const mesh = new PIXI.Sprite(PIXI.Texture.WHITE);
+mesh.position.set(20, 20);
+mesh.width = mesh.height = 120;
+mesh.tint = 0x805020;
+mesh.unoccludedAlpha = 1;
+const tile = { id: "tile", document: documentData, mesh, isVisible: true, renderFlags: { set() {} } };
+primary.addChild(mesh);
+const weather = primary.addChild(new PIXI.Container());
+weather.weatherEffects = weather.addChild(new PIXI.Container());
+const snow = new PIXI.Sprite(PIXI.Texture.WHITE);
+snow.width = snow.height = 160;
+snow.blendMode = PIXI.BLEND_MODES.SCREEN;
+const vertex = `
+  attribute vec2 aVertexPosition;
+  uniform mat3 projectionMatrix;
+  uniform vec4 inputSize;
+  uniform vec4 outputFrame;
+  varying vec2 vTextureCoord;
+  varying vec2 vUvs;
+  varying vec2 vUvsOcclusion;
+  varying vec2 vUvsTerrain;
+  varying vec2 vStaticUvs;
+  void main(void) {
+    vec2 position = aVertexPosition * max(outputFrame.zw, vec2(0.0)) + outputFrame.xy;
+    gl_Position = vec4((projectionMatrix * vec3(position, 1.0)).xy, 0.0, 1.0);
+    vTextureCoord = aVertexPosition * outputFrame.zw * inputSize.zw;
+    vUvs = vTextureCoord * 2.5;
+    vUvsOcclusion = vUvsTerrain = vStaticUvs = vTextureCoord;
+  }
+`;
+const fragment = window.foundrySnowShader ?? `
+  varying vec2 vTextureCoord;
+  void main(void) {
+    float snow = step(0.8, fract(vTextureCoord.x * 13.0)) * step(0.6, fract(vTextureCoord.y * 11.0));
+    gl_FragColor = vec4(vec3(snow * 0.6), 1.0);
+  }
+`;
+const snowFilter = new PIXI.Filter(vertex, fragment, {
+  useOcclusion: false, useTerrain: false, tint: [0.95, 1, 1], time: 0.73, alpha: 1, direction: 0.8
+});
+snowFilter.blendMode = PIXI.BLEND_MODES.SCREEN;
+snow.filters = [snowFilter];
+weather.weatherEffects.addChild(snow);
+window.canvas = {
+  ready: true, app: { ticker, renderer }, stage, primary, rendered, environment: rendered, effects, visibility, weather,
+  performance: { mode: 2 },
+  tiles: { placeables: [tile], get(id) { return this.placeables.find(tile => tile.id === id); }, preview: { children: [] } }
+};
+const render = () => {
+  for (const [callback, context] of [...ticks]) callback.call(context);
+  renderer.render(stage);
+};
+const pixels = () => {
+  const bytes = new Uint8Array(160 * 160 * 4);
+  renderer.gl.readPixels(0, 0, 160, 160, renderer.gl.RGBA, renderer.gl.UNSIGNED_BYTE, bytes);
+  return bytes;
+};
+const pixel = (bytes, x, y) => Array.from(bytes.slice(((159 - y) * 160 + x) * 4, ((159 - y) * 160 + x) * 4 + 3));
+const change = (lighting, ignore) => {
+  strength = lighting;
+  ignoreWeather = ignore;
+  hook("refreshObject", tile);
+  render();
+  return pixels();
+};
+
+try {
+  // References use the native SCREEN shader without the module.
+  render();
+  const normalWeather = pixels();
+  weather.visible = false;
+  render();
+  const normalDry = pixels();
+  effects.alpha = 0;
+  render();
+  const unlitDry = pixels();
+  weather.visible = true;
+  render();
+  const unlitWeather = pixels();
+  effects.alpha = 0.25;
+
+  let snowyPoint;
+  let clearPoint;
+  for (let y = 30; y < 130; y++) for (let x = 30; x < 130; x++) {
+    const dry = pixel(unlitDry, x, y);
+    const snow = pixel(unlitWeather, x, y);
+    if (!snowyPoint && snow[2] - dry[2] > 40) snowyPoint = [x, y];
+    if (!clearPoint && near(dry, snow, 0)) clearPoint = [x, y];
+  }
+  assert(snowyPoint && clearPoint, "the native snow shader produces flakes and clear pixels");
+  await import("/module.js");
+  hook("canvasReady");
+
+  for (const [lighting, ignore, reference, name] of [
+    [0, 0, normalWeather, "0 / 0 preserves native lit weather"],
+    [0, 1, normalDry, "0 / 1 removes weather while keeping normal lighting"],
+    [1, 0, unlitWeather, "1 / 0 preserves native snow over the unlit tile"],
+    [1, 1, unlitDry, "1 / 1 produces the original tile color without weather"]
+  ]) {
+    const actual = change(lighting, ignore);
+    for (const point of [snowyPoint, clearPoint]) {
+      assert(near(pixel(actual, ...point), pixel(reference, ...point)),
+        name + " at " + point + ": " + pixel(actual, ...point) + " expected " + pixel(reference, ...point));
+    }
+  }
+  const halfDry = change(0.5, 1);
+  const expectedHalf = pixel(normalDry, ...clearPoint).map((value, index) => (value + pixel(unlitDry, ...clearPoint)[index]) / 2);
+  assert(near(pixel(halfDry, ...clearPoint), expectedHalf), "partial lighting strength blends lit and unlit color");
+  const halfWet = change(0.5, 0);
+  assert(pixel(halfWet, ...snowyPoint)[2] > pixel(halfDry, ...snowyPoint)[2] + 20,
+    "weather remains visible at partial lighting strength");
+  for (const lighting of [0, 0.5, 1]) {
+    const wet = change(lighting, 0);
+    const dry = change(lighting, 1);
+    for (const suppression of [0.25, 0.5, 0.75]) {
+      const actual = change(lighting, suppression);
+      const expected = pixel(wet, ...snowyPoint).map((value, index) =>
+        value * (1 - suppression) + pixel(dry, ...snowyPoint)[index] * suppression);
+      assert(near(pixel(actual, ...snowyPoint), expected),
+        "weather suppression " + suppression + " scales weather continuously at lighting strength " + lighting);
+    }
+  }
+  for (const discarded of [true, false, undefined]) {
+    const actual = change(0, discarded);
+    assert(near(pixel(actual, ...snowyPoint), pixel(normalWeather, ...snowyPoint)),
+      "saved weather value " + discarded + " resets to zero");
+  }
+
+  // Exercise the actual template and both live-preview input handlers.
+  window.jQuery = class JQuery {};
+  const template = await (await fetch("/template.hbs")).text();
+  window.foundry = { applications: { handlebars: { async getTemplate() {
+    return values => template.replace(/\{\{\s*localize\s*"([^"]+)"\s*\}\}/g, "$1")
+      .replace(/\{\{\s*(value|weatherValue)\s*\}\}/g, (_, key) => values[key]);
+  } } } };
+  const form = document.createElement("form");
+  form.innerHTML = '<div class="form-group"><input name="alpha"></div>';
+  document.body.append(form);
+  const app = { document: documentData, setPosition() {} };
+  await hook("renderTileConfig", app, form);
+  const weatherSlider = form.querySelector('[name="flags.fvtt-tile-unlit.ignoreWeather"]');
+  const lightingSlider = form.querySelector('[name="flags.fvtt-tile-unlit.ignoreLighting"]');
+  assert(weatherSlider.tagName === "RANGE-PICKER" && weatherSlider.getAttribute("value") === "0.00"
+    && weatherSlider.getAttribute("min") === "0" && weatherSlider.getAttribute("max") === "1",
+    "the weather control is a 0-to-1 slider with default value zero");
+  weatherSlider.value = 0.5;
+  weatherSlider.dispatchEvent(new Event("input", { bubbles: true }));
+  render();
+  const previewHalf = pixel(pixels(), ...snowyPoint);
+  const expectedPreviewHalf = pixel(normalWeather, ...snowyPoint).map((value, index) =>
+    (value + pixel(normalDry, ...snowyPoint)[index]) / 2);
+  assert(near(previewHalf, expectedPreviewHalf), "the weather slider previews partial suppression before saving");
+  lightingSlider.value = 0.5;
+  lightingSlider.dispatchEvent(new Event("input", { bubbles: true }));
+  render();
+  const expectedBoth = pixel(halfWet, ...snowyPoint).map((value, index) =>
+    (value + pixel(halfDry, ...snowyPoint)[index]) / 2);
+  assert(near(pixel(pixels(), ...snowyPoint), expectedBoth), "lighting and weather slider previews remain independent");
+  await hook("closeTileConfig", app);
+  form.remove();
+  render();
+  assert(near(pixel(pixels(), ...snowyPoint), pixel(normalWeather, ...snowyPoint)),
+    "closing the config restores saved values instead of retaining the preview");
+
+  // A normal upper tile paints black into the selection mask. Weather must
+  // retain its native appearance over that surface, even above a dry tile.
+  const coverMesh = new PIXI.Sprite(PIXI.Texture.WHITE);
+  coverMesh.position.set(20, 20);
+  coverMesh.width = coverMesh.height = 120;
+  coverMesh.tint = 0x805020;
+  coverMesh.unoccludedAlpha = 1;
+  const cover = { id: "cover", document: { ...documentData, sort: 10, getFlag() { return false; } }, mesh: coverMesh, isVisible: true };
+  primary.addChildAt(coverMesh, primary.getChildIndex(weather));
+  canvas.tiles.placeables.push(cover);
+  const covered = change(1, 1);
+  assert(near(pixel(covered, ...snowyPoint), pixel(normalWeather, ...snowyPoint)),
+    "an ordinary covering tile keeps its own lighting and weather");
+  assert(near(pixel(covered, ...clearPoint), pixel(normalDry, ...clearPoint)),
+    "unlit color does not bleed through an ordinary covering tile");
+  canvas.tiles.placeables.pop();
+  coverMesh.destroy();
+
+  change(1, 0);
+  stage.scale.set(0.8);
+  stage.position.set(12, 8);
+  const moved = change(1, 1);
+  const movedClear = pixel(moved, Math.floor(clearPoint[0] * 0.8 + 12), Math.floor(clearPoint[1] * 0.8 + 8));
+  assert(near(movedClear, pixel(unlitDry, ...clearPoint)), "weather selection follows camera pan and zoom");
+  hook("canvasTearDown");
+  assert(weather.weatherEffects.filters === null, "teardown removes only the module's weather filters");
+  assert(snow.filters[0] === snowFilter, "teardown preserves the original snow shader");
+
+  stage.scale.set(1);
+  stage.position.set(0, 0);
+  strength = 0;
+  ignoreWeather = 0;
+  const nativeLayerFilter = new PIXI.AlphaFilter(1);
+  nativeLayerFilter.blendMode = PIXI.BLEND_MODES.SCREEN;
+  weather.filters = [nativeLayerFilter];
+  effects.alpha = 0;
+  render();
+  const nativeFiltered = pixels();
+  effects.alpha = 0.25;
+  hook("canvasReady");
+  const moduleFiltered = change(1, 0);
+  assert(near(pixel(moduleFiltered, ...snowyPoint), pixel(nativeFiltered, ...snowyPoint)),
+    "weather with a native layer-wide filter retains its final blend mode");
+  hook("canvasTearDown");
+  assert(weather.filters[0] === nativeLayerFilter && weather.filters.length === 1,
+    "native layer-wide weather filters survive teardown");
+  weather.filters = null;
+  nativeLayerFilter.destroy();
+
+  strength = 1;
+  ignoreWeather = 1;
+  const upperMesh = new PIXI.Sprite(PIXI.Texture.WHITE);
+  upperMesh.position.copyFrom(mesh.position);
+  upperMesh.width = upperMesh.height = 120;
+  upperMesh.tint = mesh.tint;
+  upperMesh.unoccludedAlpha = 1;
+  const upper = { id: "upper", mesh: upperMesh, isVisible: true, renderFlags: { set() {} },
+    document: { ...documentData, id: "upper", sort: 10, getFlag(module, key) { return key === "ignoreLighting" ? 1 : false; } } };
+  primary.addChildAt(upperMesh, primary.getChildIndex(weather));
+  canvas.tiles.placeables.push(upper);
+  hook("canvasReady");
+  render();
+  assert(near(pixel(pixels(), ...snowyPoint), pixel(unlitWeather, ...snowyPoint)),
+    "an upper weather-affected unlit tile stays above a lower weather-ignoring tile");
+  hook("canvasTearDown");
+  canvas.tiles.placeables.pop();
+  upperMesh.destroy();
+  if (window.getFoundryFogShader) {
+    const fog = new PIXI.Sprite(PIXI.Texture.WHITE);
+    fog.width = fog.height = 160;
+    fog.blendMode = PIXI.BLEND_MODES.SCREEN;
+    const fogFilter = new PIXI.Filter(vertex, window.getFoundryFogShader(), {
+      useOcclusion: false, useTerrain: false, tint: [1, 1, 1], time: -0.73,
+      alpha: 1, intensity: 0.15, slope: 1, rotation: 0
+    });
+    fogFilter.blendMode = PIXI.BLEND_MODES.SCREEN;
+    fog.filters = [fogFilter];
+    weather.weatherEffects.addChild(fog);
+    render();
+    const litBlizzard = pixels();
+    effects.alpha = 0;
+    render();
+    const brightBlizzard = pixels();
+    effects.alpha = 0.25;
+    strength = 0;
+    ignoreWeather = 0;
+    hook("canvasReady");
+    const lit = change(0, 0);
+    assert(near(pixel(lit, ...snowyPoint), pixel(litBlizzard, ...snowyPoint)),
+      "native blizzard snow and fog retain their combined SCREEN color with normal lighting");
+    const wet = change(1, 0);
+    assert(near(pixel(wet, ...snowyPoint), pixel(brightBlizzard, ...snowyPoint)),
+      "unlit blizzard snow and fog retain their combined SCREEN color");
+    change(1, 1);
+    const wetAgain = change(1, 0);
+    assert(near(pixel(wetAgain, ...snowyPoint), pixel(wet, ...snowyPoint)),
+      "repeated weather toggles do not duplicate or recolor the blizzard");
+    hook("canvasTearDown");
+    fog.destroy();
+  }
+
+  const image = document.createElement("canvas");
+  image.width = image.height = 16;
+  image.getContext("2d").fillRect(8, 0, 8, 16);
+  mesh.texture = PIXI.Texture.from(image);
+  mesh.width = mesh.height = 120;
+  mesh.position.set(130, 30);
+  mesh.scale.x = -mesh.scale.x;
+  mesh.rotation = 0.4;
+  strength = 0;
+  ignoreWeather = 0;
+  render();
+  const nativeHoles = pixels();
+  const holePoint = mesh.toGlobal(new PIXI.Point(4, 4));
+  hook("canvasReady");
+  const dryHoles = change(1, 1);
+  const hole = [Math.floor(holePoint.x), Math.floor(holePoint.y)];
+  assert(near(pixel(dryHoles, ...hole), pixel(nativeHoles, ...hole)),
+    "rotated mirrored texture holes preserve the underlying scene weather");
+  hook("canvasTearDown");
+  window.result = { ok: true, pixi: PIXI.VERSION, realFoundrySnow: Boolean(window.foundrySnowShader), checks };
+} catch (error) {
+  window.result = { ok: false, error: error.stack, checks };
+}
+</script>
